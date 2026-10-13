@@ -852,6 +852,10 @@ def _fit_models(rows, n_estimators: int = 300, random_state: int = 42,
     models = {"hgb": booster(random_state).fit(X_all, y_all)}
     if noname:   # name-free fallback: hurt held-out accuracy, kept opt-in for experiments
         models["noname"] = booster(random_state + 1).fit(X_all[:, _NONAME_IDX], y_all)
+    for m in models.values():
+        # fit-time numpy Generator; not needed for predict and not portable across numpy majors
+        if hasattr(m, "_feature_subsample_rng"):
+            m._feature_subsample_rng = None
     if use_rf:
         X_h, y_h = _select(rows, max_negatives, scorer=lambda M: models["hgb"].predict_proba(M)[:, 1])
         models["rf"] = RandomForestClassifier(
