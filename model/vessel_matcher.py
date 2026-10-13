@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from functools import lru_cache
+import multiprocessing as mp
+import os
 import re
 import unicodedata
 
@@ -710,20 +712,48 @@ class Ranker:
 # --------------------------------------------------------------------------- #
 
 
-def _row_matrices(train: pd.DataFrame, ranker: "Ranker", index: "CatalogIndex"):
+_POOL_STATE: dict = {}
+
+
+def _pool_init(ranker, index):
+    _POOL_STATE["ranker"] = ranker
+    _POOL_STATE["index"] = index
+
+
+def _train_row(row: dict):
+    ranker, index = _POOL_STATE["ranker"], _POOL_STATE["index"]
+    true_idx = index.id_to_index[str(row["target_vessel_id"])]
+    cands = ranker.candidates(row, index)
+    hit = true_idx in dict(cands)
+    if not hit:
+        cands = cands + [(true_idx, 0)]
+    X = pair_matrix(ranker, row, index, cands)
+    y = np.asarray([int(i == true_idx) for i, _ in cands], dtype=np.int8)
+    return X, y, hit
+
+
+def _query_row(row: dict):
+    ranker, index = _POOL_STATE["ranker"], _POOL_STATE["index"]
+    cands = ranker.candidates(row, index)
+    return pair_matrix(ranker, row, index, cands), [i for i, _ in cands]
+
+
+def _parallel_map(func, rows: list[dict], ranker, index, n_jobs: int | None):
+    n_jobs = n_jobs or int(os.environ.get("MATCHER_JOBS", os.cpu_count() or 1))
+    if n_jobs <= 1 or len(rows) < 64:
+        _pool_init(ranker, index)
+        return [func(r) for r in rows]
+    ctx = mp.get_context("fork")
+    with ctx.Pool(n_jobs, initializer=_pool_init, initargs=(ranker, index)) as pool:
+        return pool.map(func, rows, chunksize=max(1, len(rows) // (n_jobs * 8)))
+
+
+def _row_matrices(train: pd.DataFrame, ranker: "Ranker", index: "CatalogIndex",
+                  n_jobs: int | None = None):
     """Per train row: (matrix over candidates, label vector). Also returns candidate recall."""
-    rows = []
-    retrieved = 0
-    for row in train.to_dict("records"):
-        true_idx = index.id_to_index[str(row["target_vessel_id"])]
-        cands = ranker.candidates(row, index)
-        if true_idx not in dict(cands):
-            cands = cands + [(true_idx, 0)]
-        else:
-            retrieved += 1
-        X = pair_matrix(ranker, row, index, cands)
-        y = np.asarray([int(i == true_idx) for i, _ in cands], dtype=np.int8)
-        rows.append((X, y))
+    out = _parallel_map(_train_row, train.to_dict("records"), ranker, index, n_jobs)
+    rows = [(X, y) for X, y, _ in out]
+    retrieved = sum(int(h) for _, _, h in out)
     return rows, retrieved / max(len(train), 1)
 
 
@@ -756,7 +786,8 @@ def _score(models, X: np.ndarray) -> np.ndarray:
 
 def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         random_state: int = 42, index: CatalogIndex | None = None,
-        hard_negatives: bool = True, max_negatives: int = 40) -> dict:
+        hard_negatives: bool = True, max_negatives: int = 40,
+        n_jobs: int | None = None) -> dict:
     from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 
     if "target_vessel_id" not in train.columns:
@@ -767,7 +798,7 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         raise ValueError(f"Training targets missing from catalog: {sorted(unknown)[:5]}")
     answers = AnswerBook(train)
     ranker = Ranker(train, catalog)
-    rows, recall = _row_matrices(train, ranker, index)
+    rows, recall = _row_matrices(train, ranker, index, n_jobs=n_jobs)
 
     def forest(n: int, seed: int):
         return RandomForestClassifier(
@@ -798,7 +829,8 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
 
 
 def predict_ids(bundle: dict, queries: pd.DataFrame, index: CatalogIndex,
-                use_answers: bool = True, batch_size: int = 256) -> tuple[list[str], list[str]]:
+                use_answers: bool = True, batch_size: int = 1024,
+                n_jobs: int | None = None) -> tuple[list[str], list[str]]:
     """Predict one catalog ID per row. Returns (ids, sources)."""
     if tuple(bundle["feature_names"]) != FEATURE_NAMES:
         raise ValueError("Model and feature code versions do not match")
@@ -807,35 +839,27 @@ def predict_ids(bundle: dict, queries: pd.DataFrame, index: CatalogIndex,
     models = bundle["model"]
     if not isinstance(models, (list, tuple)):
         models = [models]
-    ids: list[str] = []
-    sources: list[str] = []
-    for start in range(0, len(queries), batch_size):
-        rows = queries.iloc[start: start + batch_size].to_dict("records")
-        pending: list[tuple[int, list[tuple[int, int]]]] = []
-        mats: list[np.ndarray] = []
-        batch_ids: list[str | None] = []
-        batch_src: list[str] = []
-        for pos, row in enumerate(rows):
-            hit = answers.lookup(row) if use_answers else None
-            if hit is not None and hit in index.id_to_index:
-                batch_ids.append(hit)
-                batch_src.append("answer_book")
-                continue
-            cands = ranker.candidates(row, index)
-            pending.append((pos, cands))
-            mats.append(pair_matrix(ranker, row, index, cands))
-            batch_ids.append(None)
-            batch_src.append("ranker")
-        if pending:
-            scores = _score(models, np.vstack(mats))
-            offset = 0
-            for pos, cands in pending:
-                local = scores[offset: offset + len(cands)]
-                batch_ids[pos] = index.ids[cands[int(np.argmax(local))][0]]
-                offset += len(cands)
-        ids.extend(batch_ids)  # type: ignore[arg-type]
-        sources.extend(batch_src)
-    return ids, sources
+    ids: list[str | None] = [None] * len(queries)
+    sources: list[str] = ["ranker"] * len(queries)
+    records = queries.to_dict("records")
+    pending: list[int] = []
+    for pos, row in enumerate(records):
+        hit = answers.lookup(row) if use_answers else None
+        if hit is not None and hit in index.id_to_index:
+            ids[pos] = hit
+            sources[pos] = "answer_book"
+        else:
+            pending.append(pos)
+    for start in range(0, len(pending), batch_size):
+        chunk = pending[start: start + batch_size]
+        results = _parallel_map(_query_row, [records[p] for p in chunk], ranker, index, n_jobs)
+        scores = _score(models, np.vstack([X for X, _ in results]))
+        offset = 0
+        for pos, (X, cand_idx) in zip(chunk, results):
+            local = scores[offset: offset + len(cand_idx)]
+            ids[pos] = index.ids[cand_idx[int(np.argmax(local))]]
+            offset += len(cand_idx)
+    return ids, sources  # type: ignore[return-value]
 
 
 def weighted_accuracy(truth: pd.DataFrame, predicted: list[str]) -> dict[str, float]:
