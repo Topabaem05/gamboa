@@ -857,16 +857,17 @@ def _rename_override(X: np.ndarray) -> int | None:
     If exactly one candidate shares the query's exact last word, lies within 1%
     in tonnage and has a compatible flag, and no *other* candidate is plausible
     by both name and tonnage, that candidate wins. On held-out folds the rule
-    fired 1254 times with zero errors.
+    fired 1230 times with zero errors.
     """
     f = _FEATURE_IDX
     exact_last = (X[:, f["last_token_exact"]] == 1) & (X[:, f["best_gap"]] <= 0.01) & (
-        (X[:, f["flag_prob"]] > 0) | (X[:, f["flag_missing"]] == 1))
+        (X[:, f["flag_prob"]] > 0) | (X[:, f["flag_missing"]] == 1)) & (X[:, f["digits_match"]] > 0)
     if exact_last.sum() != 1 or X[0, f["query_is_hangul"]] == 1:
         return None
     plausible = (X[:, f["best_gap"]] <= 0.05) & (
         (X[:, f["latin_osa"]] >= 0.75) | (X[:, f["cons_lev"]] >= 0.9))
-    if (plausible & ~exact_last).any():
+    strong_name = X[:, f["latin_osa"]] >= 0.9          # the query itself names this vessel
+    if ((plausible | strong_name) & ~exact_last).any():
         return None
     return int(np.flatnonzero(exact_last)[0])
 
