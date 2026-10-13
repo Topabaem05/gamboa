@@ -25,14 +25,15 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
-VERSION = "hardcoded-lookup+phonetic-rf-v2"
+VERSION = "hardcoded-lookup+phonetic-rf-v3"
 
 FEATURE_NAMES = (
-    "latin_exact", "latin_lev", "latin_bigram_jacc", "latin_trigram_jacc",
+    "latin_exact", "latin_lev", "latin_osa", "latin_bigram_jacc", "latin_trigram_jacc",
     "latin_prefix_ratio", "latin_length_ratio",
     "cons_exact", "cons_lev", "cons_bigram_jacc", "cons_trigram_jacc", "cons_length_ratio",
-    "vow_exact", "vow_lev", "vow_bigram_jacc",
-    "token_lev_mean", "token_lev_min", "token_count_diff", "token_overlap",
+    "vow_exact", "vow_lev", "vow_osa", "vow_bigram_jacc",
+    "token_lev_mean", "token_lev_min", "token_lev_max", "token_count_diff", "token_overlap",
+    "latin_token_exact", "latin_token_osa_max",
     "digits_match", "query_has_digits",
     "gross_gap", "intl_gap", "best_gap", "gt_exact", "query_gt_missing", "cat_gt_missing",
     "flag_prob", "flag_missing", "type_prob",
@@ -86,14 +87,17 @@ def _clean(value: object) -> str:
     if not isinstance(value, str):
         return ""
     value = unicodedata.normalize("NFKC", value).upper()
+    value = re.sub(r"^\s*M\s*[/.]?\s*[VT]\s*[/.]?\s+", "", value)   # "M/V Seren" -> "Seren"
     value = re.sub(r"제\s*(\d+)", r"NO\1", value)        # 제7하나 -> NO7하나
     if len(re.findall(r"[가-힣]", value)) >= 3:
         value = re.sub(r"호\s*$", "", value)             # trailing 호 (ship suffix)
     # "No. 2 Asian Pioneer" / "Ocean Pioneer No. 2" / 제2 -> move the hull number to the end
+    value = re.sub(r"\b(II|III|IV)\s*$", lambda m: {"II": "2", "III": "3", "IV": "4"}[m.group(1)], value)
+    value = re.sub(r"\b(투|쓰리)\s*$", lambda m: {"투": "2", "쓰리": "3"}[m.group(1)], value)
     numbers = re.findall(r"NO\s*\.?\s*(\d+)", value)
     if numbers:
         value = re.sub(r"NO\s*\.?\s*\d+", " ", value)
-        value = value.strip() + "".join(f" NO{n}" for n in numbers)
+        value = value.strip() + "".join(f" {n}" for n in numbers)
     return value.strip()
 
 
@@ -115,14 +119,26 @@ _VOWELS = set("AEIOU")
 
 
 def _english_phones(word: str) -> list[str]:
-    """Map an upper-case Latin word to (class, is_vowel) items."""
+    """Map an upper-case Latin word to phone classes (vowels lower-case)."""
     w = word
-    w = re.sub(r"(?<=[AEIOU])GH", "", w)
-    w = w.replace("TCH", "C").replace("CH", "C").replace("SH", "S").replace("PH", "P")
-    w = w.replace("TH", "T").replace("CK", "K").replace("QU", "K").replace("WH", "W")
-    w = w.replace("DG", "S").replace("X", "KS")
-    w = re.sub(r"^KN", "N", w).replace("WR", "R")
+    w = re.sub(r"([BDFGHJ-NP-TVWXZ])\1", r"\1", w)          # double consonants (not CC)
+    w = re.sub(r"(?<=[AEIOU])GH", "", w)                       # Highway, Eight
+    w = re.sub(r"^GH", "K", w)                                  # Ghazal
+    w = w.replace("CHEM", "KEM").replace("CHOR", "KOR").replace("CHR", "KR").replace("CHL", "KL")
+    w = w.replace("CHT", "Č").replace("TCH", "Č").replace("CH", "Č").replace("SH", "S").replace("PH", "P")
+    w = re.sub(r"^TH", "T", w).replace("TH", "S")              # Thor -> 토르, Zenith -> 제니스
+    w = w.replace("CK", "K").replace("QU", "K").replace("WH", "W")
+    w = w.replace("ZH", "S").replace("BH", "B").replace("DH", "D").replace("KH", "K")
+    w = w.replace("DG", "S").replace("TION", "SON").replace("SION", "SON")
+    w = re.sub(r"^X", "S", w).replace("X", "KS")               # Xiu -> 슈, Galaxy -> 갤럭시
+    w = w.replace("WR", "R")
+    w = re.sub(r"^TS", "S", w)                                  # Tsurugi -> 쮸루기
+    w = w.replace("NGY", "NY")                                  # Kwangyang -> 광양
     w = re.sub(r"NG(?![AEIOUYLR])", "N", w)
+    w = re.sub(r"NH$", "N", w)                                  # Hochiminh -> 호치민
+    w = re.sub(r"(?<=[AEIOU])H$", "", w)                        # Sarah -> 사라
+    w = re.sub(r"R(?![AEIOUYW])", "", w)                       # Harbour -> 하버, Lombard -> 롬바드
+    silent_e = len(w) > 3 and w.endswith("E") and w[-2] not in "AEIOU"
     out: list[str] = []
     n = len(w)
     for i, ch in enumerate(w):
@@ -132,13 +148,15 @@ def _english_phones(word: str) -> list[str]:
         elif ch in "AEIOU":
             out.append(ch.lower())
         elif ch == "Y":
-            out.append("i" if (i == n - 1 or nxt not in "AEIOU") else "")
+            out.append("i" if (not nxt or nxt not in "AEIOU") else "")
         elif ch == "W":
-            out.append("" if nxt in "OU" else "")
+            out.append("")
+        elif ch == "Č":
+            out.append("C")
         elif ch == "C":
-            out.append("S" if nxt in "EIY" else "K")
+            out.append("S" if (nxt and nxt in "EIY") else "K")
         elif ch == "G":
-            out.append("S" if nxt in "EIY" else "K")
+            out.append("S" if (nxt and nxt in "EIY") else "K")
         elif ch in "JZS":
             out.append("S")
         elif ch in "BV":
@@ -151,7 +169,10 @@ def _english_phones(word: str) -> list[str]:
             out.append("R")
         else:
             out.append(ch)
-    return [p for p in out if p]
+    out = [p for p in out if p]
+    if silent_e and out and out[-1] == "e":
+        out.pop()
+    return out
 
 
 def _hangul_phones(word: str) -> list[str]:
@@ -162,6 +183,8 @@ def _hangul_phones(word: str) -> list[str]:
                 out.extend(_english_phones(ch.upper()) if ch.isalpha() else [ch])
             continue
         ini, vow, fin = _INIT_CLS[i], _MED_VOW[m], _FIN_CLS[f]
+        if i == 5 and m == 18 and f == 0:
+            continue
         if ini:
             out.append(ini)
         if vow:
@@ -217,27 +240,7 @@ def _phones(value: object) -> list[list[str]]:
 
 def _consonant_string(phones: list[str]) -> str:
     s = "".join(p for p in phones if not p.islower())
-    # post-vocalic R (not followed by a consonant-class vowel) is dropped in
-    # Korean transliteration (Harbour -> 하버); drop it on both sides.
-    keep = []
-    for i, ch in enumerate(s):
-        if ch == "R" and not _r_before_vowel(phones, i, s):
-            continue
-        keep.append(ch)
-    s = "".join(keep)
     return re.sub(r"([^0-9])\1+", r"\1", s)
-
-
-def _r_before_vowel(phones: list[str], cons_index: int, cons_string: str) -> bool:
-    """True when the ``cons_index``-th consonant in ``phones`` is followed by a vowel."""
-    count = -1
-    for j, p in enumerate(phones):
-        if not p.islower():
-            count += 1
-            if count == cons_index:
-                nxt = phones[j + 1] if j + 1 < len(phones) else ""
-                return nxt.islower()
-    return False
 
 
 def _vowel_string(phones: list[str]) -> str:
@@ -246,15 +249,16 @@ def _vowel_string(phones: list[str]) -> str:
 
 
 @lru_cache(maxsize=None)
-def name_reps(value: str) -> tuple[str, str, str, tuple[str, ...], frozenset[str]]:
-    """(latin_key, consonant_string, vowel_string, token_consonant_strings, digits)."""
+def name_reps(value: str) -> tuple[str, str, str, tuple[str, ...], frozenset[str], tuple[str, ...]]:
+    """(latin_key, consonant_string, vowel_string, token_consonant_strings, digits, latin_tokens)."""
     phones = _phones(value)
     cons_tokens = tuple(_consonant_string(p) for p in phones)
     cons = "".join(cons_tokens)
     cons = re.sub(r"([^0-9])\1+", r"\1", cons)
     vow = "".join(_vowel_string(p) for p in phones)
     digits = frozenset(re.findall(r"\d+", _clean(value)))
-    return latin_key(value), cons, vow, cons_tokens, digits
+    latin_tokens = tuple(latin_key(t) for t in tokens(value))
+    return latin_key(value), cons, vow, cons_tokens, digits, latin_tokens
 
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +297,28 @@ def lev_sim(a: str, b: str) -> float:
             cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
         prev = cur
     return 1.0 - prev[-1] / len(a)
+
+
+@lru_cache(maxsize=2_000_000)
+def osa_sim(a: str, b: str) -> float:
+    """1 - normalised optimal-string-alignment distance (transposition costs 1)."""
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    la, lb = len(a), len(b)
+    d = [[0] * (lb + 1) for _ in range(la + 1)]
+    for i in range(la + 1):
+        d[i][0] = i
+    for j in range(lb + 1):
+        d[0][j] = j
+    for i in range(1, la + 1):
+        for j in range(1, lb + 1):
+            cost = a[i - 1] != b[j - 1]
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return 1.0 - d[la][lb] / max(la, lb)
 
 
 def positive_float(value: object) -> float | None:
@@ -400,6 +426,7 @@ class CatalogIndex:
         self.vow = [r[2] for r in reps]
         self.cons_tokens = [r[3] for r in reps]
         self.digits = [r[4] for r in reps]
+        self.latin_tokens = [r[5] for r in reps]
         self.token_sets = [frozenset(tokens(v)) for v in raw_names]
         self.flags = self.catalog["flag_name"].astype(str).tolist() if "flag_name" in self.catalog else [""] * len(self.ids)
         self.types = self.catalog["vessel_type"].astype(str).tolist() if "vessel_type" in self.catalog else [""] * len(self.ids)
@@ -485,7 +512,7 @@ class Ranker:
                    max_candidates: int = 90) -> list[tuple[int, int]]:
         """Return (catalog_index, source_bits): 1 = name, 2 = tonnage, 4 = exact."""
         name = row.get("vessel_name")
-        latin, cons, vow, _, _ = name_reps(name if isinstance(name, str) else "")
+        latin, cons, vow, _, _, _ = name_reps(name if isinstance(name, str) else "")
         gross = positive_float(row.get("gross_tonnage"))
         intl = positive_float(row.get("international_gross_tonnage"))
         output: dict[int, int] = {}
@@ -528,9 +555,9 @@ class Ranker:
 
     def features(self, row: dict, index: CatalogIndex, cand: int, bits: int) -> list[float]:
         name = row.get("vessel_name")
-        qlatin, qcons, qvow, qtoks, qdigits = name_reps(name if isinstance(name, str) else "")
+        qlatin, qcons, qvow, qtoks, qdigits, qlt = name_reps(name if isinstance(name, str) else "")
         clatin, ccons, cvow = index.latin[cand], index.cons[cand], index.vow[cand]
-        ctoks, cdigits = index.cons_tokens[cand], index.digits[cand]
+        ctoks, cdigits, clt = index.cons_tokens[cand], index.digits[cand], index.latin_tokens[cand]
         gross = positive_float(row.get("gross_tonnage"))
         intl = positive_float(row.get("international_gross_tonnage"))
         cgt = positive_float(index.gt[cand])
@@ -549,8 +576,15 @@ class Ranker:
             best = [max(lev_sim(a, b) for b in ctoks) for a in qtoks if a]
             tok_mean = float(np.mean(best)) if best else 0.0
             tok_min = float(min(best)) if best else 0.0
+            tok_max = float(max(best)) if best else 0.0
         else:
-            tok_mean = tok_min = 0.0
+            tok_mean = tok_min = tok_max = 0.0
+        if qlt and clt:
+            lt_best = [max(osa_sim(a, b) for b in clt) for a in qlt if a]
+            latin_token_exact = float(sum(1 for a in qlt if a and a in clt))
+            latin_token_osa_max = float(max(lt_best)) if lt_best else 0.0
+        else:
+            latin_token_exact = latin_token_osa_max = 0.0
         qtok_set = frozenset(tokens(name))
         if qdigits or cdigits:
             digits_match = float(qdigits == cdigits)
@@ -559,6 +593,7 @@ class Ranker:
         return [
             float(bool(qlatin) and qlatin == clatin),
             lev_sim(qlatin, clatin),
+            osa_sim(qlatin, clatin),
             jaccard(grams(qlatin, 2), index.latin_bi.sets[cand]),
             jaccard(grams(qlatin, 3), index.latin_tri.sets[cand]),
             prefix / max(len(qlatin), len(clatin), 1),
@@ -570,11 +605,15 @@ class Ranker:
             min(len(qcons), len(ccons)) / max(len(qcons), len(ccons), 1),
             float(bool(qvow) and qvow == cvow),
             lev_sim(qvow, cvow),
+            osa_sim(qvow, cvow),
             jaccard(grams(qvow, 2), index.vow_bi.sets[cand]),
             tok_mean,
             tok_min,
+            tok_max,
             float(abs(len(qtoks) - len(ctoks))),
             jaccard(qtok_set, index.token_sets[cand]),
+            latin_token_exact,
+            latin_token_osa_max,
             digits_match,
             float(bool(qdigits)),
             g_gap,
@@ -599,25 +638,50 @@ class Ranker:
 
 
 def make_training_pairs(train: pd.DataFrame, ranker: Ranker, index: CatalogIndex,
-                        max_negatives: int = 40) -> tuple[np.ndarray, np.ndarray, float]:
+                        max_negatives: int = 40, hard_model=None, keep_first: int = 15):
+    """Positive pair + negatives for every train row.
+
+    Without ``hard_model`` negatives are the first ``max_negatives`` retrieved
+    candidates. With it, negatives are the hardest ones: the ``keep_first``
+    first-retrieved plus the highest-scoring candidates under ``hard_model``.
+    Returns (X, y, groups, candidate_recall).
+    """
     feats: list[list[float]] = []
     labels: list[int] = []
+    groups: list[int] = []
     retrieved = 0
-    for row in train.to_dict("records"):
+    for gid, row in enumerate(train.to_dict("records")):
         true_idx = index.id_to_index[str(row["target_vessel_id"])]
         cands = ranker.candidates(row, index)
         cand_map = dict(cands)
         retrieved += int(true_idx in cand_map)
-        negatives = [(i, b) for i, b in cands if i != true_idx][:max_negatives]
-        for i, b in [(true_idx, cand_map.get(true_idx, 0))] + negatives:
-            feats.append(ranker.features(row, index, i, b))
+        negatives = [(i, b) for i, b in cands if i != true_idx]
+        if hard_model is not None and len(negatives) > max_negatives:
+            neg_feats = [ranker.features(row, index, i, b) for i, b in negatives]
+            scores = hard_model.predict_proba(np.asarray(neg_feats, dtype=np.float32))[:, 1]
+            order = np.argsort(-scores, kind="mergesort")
+            chosen = list(range(min(keep_first, len(negatives))))
+            for j in order:
+                if len(chosen) >= max_negatives:
+                    break
+                if int(j) not in chosen:
+                    chosen.append(int(j))
+            pairs = [(true_idx, cand_map.get(true_idx, 0), None)]
+            pairs += [(negatives[j][0], negatives[j][1], neg_feats[j]) for j in chosen]
+        else:
+            pairs = [(true_idx, cand_map.get(true_idx, 0), None)]
+            pairs += [(i, b, None) for i, b in negatives[:max_negatives]]
+        for i, b, f in pairs:
+            feats.append(f if f is not None else ranker.features(row, index, i, b))
             labels.append(int(i == true_idx))
+            groups.append(gid)
     return (np.asarray(feats, dtype=np.float32), np.asarray(labels, dtype=np.int8),
-            retrieved / max(len(train), 1))
+            np.asarray(groups, dtype=np.int32), retrieved / max(len(train), 1))
 
 
 def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
-        random_state: int = 42, index: CatalogIndex | None = None) -> dict:
+        random_state: int = 42, index: CatalogIndex | None = None,
+        hard_negatives: bool = True) -> dict:
     from sklearn.ensemble import RandomForestClassifier
 
     if "target_vessel_id" not in train.columns:
@@ -628,12 +692,20 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         raise ValueError(f"Training targets missing from catalog: {sorted(unknown)[:5]}")
     answers = AnswerBook(train)
     ranker = Ranker(train, catalog)
-    X, y, recall = make_training_pairs(train, ranker, index)
-    model = RandomForestClassifier(
-        n_estimators=n_estimators, max_depth=None, min_samples_leaf=2, max_features="sqrt",
-        class_weight="balanced_subsample", n_jobs=-1, random_state=random_state,
-    )
-    model.fit(X, y)
+
+    def forest(n: int, seed: int):
+        return RandomForestClassifier(
+            n_estimators=n, max_depth=None, min_samples_leaf=2, max_features="sqrt",
+            class_weight="balanced_subsample", n_jobs=-1, random_state=seed,
+        )
+
+    # Stage 1: retrieval-order negatives.
+    X, y, _, recall = make_training_pairs(train, ranker, index)
+    stage1 = forest(max(100, n_estimators // 2), random_state).fit(X, y)
+    # Stage 2: hard negatives mined with the stage-1 model.
+    if hard_negatives:
+        X, y, _, _ = make_training_pairs(train, ranker, index, hard_model=stage1)
+    model = forest(n_estimators, random_state + 1).fit(X, y)
     return {
         "version": VERSION,
         "feature_names": FEATURE_NAMES,
