@@ -27,7 +27,7 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
-VERSION = "hardcoded-lookup+phonetic-hgb-rules-v6"
+VERSION = "hardcoded-lookup+phonetic-hgb-rules-v7-hangul-aug"
 
 FEATURE_NAMES = (
     "latin_exact", "latin_lev", "latin_osa", "latin_bigram_jacc", "latin_trigram_jacc",
@@ -134,7 +134,7 @@ def _clean(value: object) -> str:
         return ""
     value = unicodedata.normalize("NFKC", value).upper()
     value = re.sub(r"^\s*M\s*[/.]?\s*[VT]\s*[/.]?\s+", "", value)   # "M/V Seren" -> "Seren"
-    value = re.sub(r"제\s*(\d+)", r"NO\1", value)        # 제7하나 -> NO7하나
+    value = re.sub(r"[제재]\s*(\d+)", r"NO\1", value)    # 제7하나 / 재7하나 -> NO7하나
     if len(re.findall(r"[가-힣]", value)) >= 3:
         value = re.sub(r"호\s*$", "", value)             # trailing 호 (ship suffix)
     # "No. 2 Asian Pioneer" / "Ocean Pioneer No. 2" / 제2 -> move the hull number to the end
@@ -264,12 +264,28 @@ _INITIALISM = re.compile(r"^[B-DF-HJ-NP-TV-Z]{2,4}$")
 _LETTER_KEYS = sorted(_LETTER_NAMES, key=len, reverse=True)
 
 
+def _letter_norm(token: str) -> str:
+    """ㅐ -> ㅔ and ㅆ -> ㅅ (Korean spells 제이/재이, 에스/에쓰 interchangeably)."""
+    out = []
+    for ch in token:
+        code = ord(ch) - 0xAC00
+        if 0 <= code <= 11171:
+            i, m, f = code // 588, (code % 588) // 28, code % 28
+            m = 5 if m == 1 else m
+            i = 9 if i == 10 else i
+            ch = chr(0xAC00 + i * 588 + m * 28 + f)
+        out.append(ch)
+    return "".join(out)
+
+
 def split_letter_names(token: str) -> tuple[str, str]:
     """Greedy parse of spelled-out Latin letters at the start of a Hangul token.
 
     ``케이에스`` -> ("KS", ""), ``엠에스살비아`` -> ("MS", "살비아"),
     ``에이스`` -> ("", "에이스") (fewer than two letters: not an initialism).
     """
+    original = token
+    token = _letter_norm(token)
     letters = []
     pos = 0
     while pos < len(token):
@@ -281,8 +297,8 @@ def split_letter_names(token: str) -> tuple[str, str]:
         else:
             break
     if len(letters) >= 2:
-        return "".join(letters), token[pos:]
-    return "", token
+        return "".join(letters), original[pos:]
+    return "", original
 
 
 def _phones(value: object) -> list[list[str]]:
@@ -394,6 +410,132 @@ def relative_gap(left: float | None, right: float | None) -> float:
     if left is None or right is None:
         return 2.0
     return min(abs(left - right) / max(left, right, 1.0), 2.0)
+
+
+# --------------------------------------------------------------------------- #
+# Hangul spelling variation (training-time augmentation)
+# --------------------------------------------------------------------------- #
+# Variants observed between train rows for the same English word: 보이저/보이져, 파이오니아/
+# 파이오니어, 썬/선, 갤럭시/겔럭시, 스피리트/스피릿, 다리야/다랴, 엠에스/엠에쓰, 톈진/텐진,
+# 산동/샨동, optional 호 suffix and spacing.
+
+def _hdec(ch):
+    c = ord(ch) - 0xAC00
+    return (c // 588, (c % 588) // 28, c % 28) if 0 <= c <= 11171 else None
+
+
+def _henc(i, m, f):
+    return chr(0xAC00 + i * 588 + m * 28 + f)
+
+
+_GLIDE = {6: 4, 4: 6, 12: 8, 8: 12, 17: 13, 13: 17}       # ㅕ/ㅓ ㅛ/ㅗ ㅠ/ㅜ after ㅈ/ㅊ
+_DOUBLE = {10: 9, 9: 10, 4: 3, 3: 4}                       # ㅆ/ㅅ ㄸ/ㄷ
+
+
+def _vary_word(word: str, rng) -> str:
+    chars = list(word)
+    ops = []
+    for k, ch in enumerate(chars):
+        d = _hdec(ch)
+        if not d:
+            continue
+        i, m, f = d
+        if m in (1, 5):
+            ops.append(("ae_e", k))
+        if m == 4 and f == 0 and k == len(chars) - 1:
+            ops.append(("eo_a", k))
+        if i in (12, 14) and m in _GLIDE:
+            ops.append(("glide", k))
+        if i in _DOUBLE:
+            ops.append(("double", k))
+        if ch == "트" and k == len(chars) - 1 and k > 0 and _hdec(chars[k - 1]) and _hdec(chars[k - 1])[2] == 0:
+            ops.append(("teu_final", k))
+        if f == 19 and k == len(chars) - 1:
+            ops.append(("final_s_teu", k))
+        if ch in ("아", "어") and k == len(chars) - 1 and k > 0 and chars[k - 1] in "니리":
+            ops.append(("nia", k))
+        if i in (2, 5, 9) and m in (2, 6):
+            ops.append(("ya", k))
+    if not ops:
+        return word
+    op, k = ops[rng.randrange(len(ops))]
+    i, m, f = _hdec(chars[k])
+    if op == "ae_e":
+        chars[k] = _henc(i, 5 if m == 1 else 1, f)
+    elif op == "eo_a":
+        chars[k] = _henc(i, 0, f)
+    elif op == "glide":
+        chars[k] = _henc(i, _GLIDE[m], f)
+    elif op == "double":
+        chars[k] = _henc(_DOUBLE[i], m, f)
+    elif op == "teu_final":
+        pi, pm, _ = _hdec(chars[k - 1])
+        chars[k - 1] = _henc(pi, pm, 19)
+        del chars[k]
+    elif op == "final_s_teu":
+        chars[k] = _henc(i, m, 0)
+        chars.insert(k + 1, "트")
+    elif op == "nia":
+        chars[k] = "어" if chars[k] == "아" else "아"
+    elif op == "ya":
+        chars[k] = _henc(i, 0 if m == 2 else 4, f)
+    return "".join(chars)
+
+
+def respell_hangul(name: str, rng) -> str:
+    """One realistic alternative Korean spelling of ``name`` (1-2 variations)."""
+    toks = name.split()
+    if not toks:
+        return name
+    for _ in range(rng.choice([1, 1, 2])):
+        r = rng.random()
+        if r < 0.15 and len(toks) >= 2:
+            j = rng.randrange(len(toks) - 1)
+            toks[j:j + 2] = [toks[j] + toks[j + 1]]
+        elif r < 0.25:
+            toks[-1] = toks[-1][:-1] if toks[-1].endswith("호") and len(toks[-1]) > 2 else toks[-1] + "호"
+        else:
+            j = rng.randrange(len(toks))
+            toks[j] = _vary_word(toks[j], rng)
+    return " ".join(toks)
+
+
+def _tonnage_noise_pairs(train: pd.DataFrame, catalog: pd.DataFrame) -> np.ndarray:
+    """Observed (gross, international) relative noise pairs, one per train row with a known
+    catalog tonnage; NaN where the query tonnage is missing. Keeps their coupling (a large gross
+    gap always comes with an exact international tonnage in this data)."""
+    cgt = train["target_vessel_id"].map(catalog.set_index("vessel_id")["gross_tonnage"]).astype(float)
+    ok = cgt > 0
+    g = (train["gross_tonnage"].astype(float) / cgt - 1.0)[ok]
+    i = (train["international_gross_tonnage"].astype(float) / cgt - 1.0)[ok]
+    return np.column_stack([g.to_numpy(), i.to_numpy()])
+
+
+def augment_hangul(train: pd.DataFrame, catalog: pd.DataFrame | None = None, copies: int = 3,
+                   seed: int = 7) -> pd.DataFrame:
+    """Extra training rows: each Korean-named vessel re-spelled ``copies`` times (one spelling
+    per vessel and copy, applied to all of its rows, as in the real data), with tonnage noise
+    re-drawn from the observed (gross, international) noise pairs."""
+    import random
+    rng = random.Random(seed)
+    nrng = np.random.default_rng(seed)
+    hang = train[train["vessel_name"].map(is_hangul)]
+    pairs = _tonnage_noise_pairs(train, catalog) if catalog is not None else None
+    cgt = (hang["target_vessel_id"].map(catalog.set_index("vessel_id")["gross_tonnage"]).astype(float)
+           if catalog is not None else None)
+    extra = []
+    for c in range(copies):
+        names = {v: respell_hangul(n, rng) for v, n in hang.groupby("target_vessel_id")["vessel_name"].first().items()}
+        df = hang.copy()
+        df["vessel_name"] = df["target_vessel_id"].map(names)
+        if pairs is not None and len(pairs):
+            draw = pairs[nrng.integers(0, len(pairs), size=len(df))]
+            has = (cgt > 0).to_numpy()
+            df.loc[has, "gross_tonnage"] = np.round(cgt[has].to_numpy() * (1 + draw[has, 0]))
+            df.loc[has, "international_gross_tonnage"] = np.round(cgt[has].to_numpy() * (1 + draw[has, 1]))
+        df["sample_id"] = df["sample_id"].astype(str) + f"_aug{c}"
+        extra.append(df)
+    return pd.concat(extra, ignore_index=True) if extra else train.iloc[0:0]
 
 
 # --------------------------------------------------------------------------- #
@@ -1109,7 +1251,7 @@ _FEATURE_IDX = {name: i for i, name in enumerate(FEATURE_NAMES)}
 def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         random_state: int = 42, index: CatalogIndex | None = None,
         use_rf: bool = False, noname: bool = False, n_jobs: int | None = None,
-        **_ignored) -> dict:
+        augment_copies: int = 3, **_ignored) -> dict:
     if "target_vessel_id" not in train.columns:
         raise ValueError("Training data needs target_vessel_id")
     index = index or CatalogIndex(catalog)
@@ -1118,7 +1260,10 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         raise ValueError(f"Training targets missing from catalog: {sorted(unknown)[:5]}")
     answers = AnswerBook(train)
     ranker = Ranker(train, catalog)
-    rows, recall = _row_matrices(train, ranker, index, n_jobs=n_jobs)
+    model_rows = train
+    if augment_copies > 0:
+        model_rows = pd.concat([train, augment_hangul(train, catalog, copies=augment_copies)], ignore_index=True)
+    rows, recall = _row_matrices(model_rows, ranker, index, n_jobs=n_jobs)
     models = _fit_models(rows, n_estimators=n_estimators, random_state=random_state,
                          use_rf=use_rf, noname=noname)
     return {
