@@ -1,0 +1,5 @@
+# The DACON evaluation image preinstalls numpy, pandas, scikit-learn (1.5.x) and joblib.
+numpy
+pandas
+scikit-learn==1.5.2
+joblib
