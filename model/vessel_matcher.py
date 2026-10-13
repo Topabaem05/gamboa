@@ -1003,7 +1003,9 @@ def _type_size_rule(X: np.ndarray, ratio: float = 10.0) -> int | None:
     f = _FEATURE_IDX
     if X[0, f["query_gt_missing"]] != 1:
         return None
-    tied = np.flatnonzero(X[:, f["is_max_name_score"]] == 1)
+    # only genuinely name-plausible, type-compatible candidates may be tie-broken by size
+    tied = np.flatnonzero((X[:, f["is_max_name_score"]] == 1) & (X[:, f["latin_osa"]] >= 0.8)
+                          & (X[:, f["type_prob"]] > 0))
     if len(tied) < 2:
         return None
     p = np.exp(X[tied, f["type_size_logp"]])
