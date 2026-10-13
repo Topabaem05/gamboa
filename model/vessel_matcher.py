@@ -27,7 +27,7 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
-VERSION = "hardcoded-lookup+phonetic-ensemble-v4"
+VERSION = "hardcoded-lookup+phonetic-hgb-v5"
 
 FEATURE_NAMES = (
     "latin_exact", "latin_lev", "latin_osa", "latin_bigram_jacc", "latin_trigram_jacc",
@@ -36,6 +36,7 @@ FEATURE_NAMES = (
     "vow_exact", "vow_lev", "vow_osa", "vow_bigram_jacc",
     "token_lev_mean", "token_lev_min", "token_lev_max", "token_count_diff", "token_overlap",
     "latin_token_exact", "latin_token_osa_max",
+    "first_token_exact", "last_token_exact", "last_token_osa", "last_token_cons_lev",
     "digits_match", "query_has_digits",
     "gross_gap", "intl_gap", "best_gap", "gt_exact", "query_gt_missing", "cat_gt_missing",
     "flag_prob", "flag_missing", "type_prob",
@@ -56,7 +57,7 @@ FEATURE_NAMES = (
 _BASE_FEATURES = FEATURE_NAMES[:FEATURE_NAMES.index("n_candidates")]
 _LISTWISE = (("best_gap", "min"), ("cons_lev", "max"), ("latin_osa", "max"), ("vow_lev", "max"),
              ("flag_prob", "max"), ("type_prob", "max"), ("latin_token_exact", "max"),
-             ("token_lev_max", "max"), ("digits_match", "max"))
+             ("token_lev_max", "max"), ("digits_match", "max"), ("last_token_osa", "max"))
 
 
 def pair_matrix(ranker: "Ranker", row: dict, index: "CatalogIndex",
@@ -658,8 +659,18 @@ class Ranker:
             lt_best = [max(osa_sim(a, b) for b in clt) for a in qlt if a]
             latin_token_exact = float(sum(1 for a in qlt if a and a in clt))
             latin_token_osa_max = float(max(lt_best)) if lt_best else 0.0
+            # the distinctive ship name is usually the last word (company prefix first)
+            q_words = [t for t in qlt if t and not t.isdigit()] or list(qlt)
+            c_words = [t for t in clt if t and not t.isdigit()] or list(clt)
+            first_token_exact = float(q_words[0] == c_words[0])
+            last_token_exact = float(q_words[-1] == c_words[-1])
+            last_token_osa = osa_sim(q_words[-1], c_words[-1])
+            qc_words = [t for t in qtoks if t and not t.isdigit()] or list(qtoks)
+            cc_words = [t for t in ctoks if t and not t.isdigit()] or list(ctoks)
+            last_token_cons_lev = lev_sim(qc_words[-1], cc_words[-1]) if qc_words and cc_words else 0.0
         else:
             latin_token_exact = latin_token_osa_max = 0.0
+            first_token_exact = last_token_exact = last_token_osa = last_token_cons_lev = 0.0
         qtok_set = frozenset(tokens(name))
         if qdigits or cdigits:
             digits_match = float(qdigits == cdigits)
@@ -689,6 +700,10 @@ class Ranker:
             jaccard(qtok_set, index.token_sets[cand]),
             latin_token_exact,
             latin_token_osa_max,
+            first_token_exact,
+            last_token_exact,
+            last_token_osa,
+            last_token_cons_lev,
             digits_match,
             float(bool(qdigits)),
             g_gap,
@@ -780,16 +795,64 @@ def _select(rows, max_negatives: int, scorer=None, keep_first: int = 15):
     return np.vstack(Xs), np.concatenate(ys)
 
 
-def _score(models, X: np.ndarray) -> np.ndarray:
-    return np.mean([m.predict_proba(X)[:, 1] for m in models], axis=0)
+# Features that do not look at the vessel name: used by the fallback scorer for
+# rows whose name matches nothing in the catalog (renamed vessels).
+NONAME_FEATURES = tuple(f for f in FEATURE_NAMES if any(f.startswith(k) for k in (
+    "gross_gap", "intl_gap", "best_gap", "gt_exact", "query_gt_missing", "cat_gt_missing",
+    "flag_prob", "flag_missing", "type_prob", "query_is_hangul", "src_tonnage", "n_candidates",
+    "is_min_gap", "is_max_flag_prob", "is_max_type_prob")))
+_NONAME_IDX = np.asarray([FEATURE_NAMES.index(f) for f in NONAME_FEATURES])
+
+
+def _fit_models(rows, n_estimators: int = 300, random_state: int = 42,
+                use_rf: bool = False, max_negatives: int = 40) -> dict:
+    """Train the scorers on cached per-row candidate matrices."""
+    from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+
+    X_all = np.vstack([X for X, _ in rows])
+    y_all = np.concatenate([y for _, y in rows])
+
+    def booster(seed: int):
+        return HistGradientBoostingClassifier(
+            max_iter=600, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
+            l2_regularization=1.0, early_stopping=False, random_state=seed,
+        )
+
+    models = {"hgb": booster(random_state).fit(X_all, y_all)}
+    models["noname"] = booster(random_state + 1).fit(X_all[:, _NONAME_IDX], y_all)
+    if use_rf:
+        X_h, y_h = _select(rows, max_negatives, scorer=lambda M: models["hgb"].predict_proba(M)[:, 1])
+        models["rf"] = RandomForestClassifier(
+            n_estimators=n_estimators, min_samples_leaf=2, max_features="sqrt",
+            class_weight="balanced_subsample", n_jobs=-1, random_state=random_state + 2,
+        ).fit(X_h, y_h)
+    return models
+
+
+def _score(models, X: np.ndarray, fallback_threshold: float = 0.02) -> np.ndarray:
+    """Raw ranking scores for the candidates of ONE query row.
+
+    The main booster's decision function is used (no probability saturation).
+    When even the best candidate is implausible by name (max probability below
+    ``fallback_threshold``) the name-free scorer decides instead.
+    """
+    if isinstance(models, (list, tuple)):          # legacy bundles
+        return np.mean([m.predict_proba(X)[:, 1] for m in models], axis=0)
+    hgb = models["hgb"]
+    score = hgb.decision_function(X)
+    if "rf" in models:
+        rf_p = np.clip(models["rf"].predict_proba(X)[:, 1], 1e-6, 1 - 1e-6)
+        score = 0.5 * score + 0.5 * np.log(rf_p / (1 - rf_p))
+    if "noname" in models:
+        best_p = 1.0 / (1.0 + np.exp(-score.max()))
+        if best_p < fallback_threshold:
+            score = models["noname"].decision_function(X[:, _NONAME_IDX])
+    return score
 
 
 def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         random_state: int = 42, index: CatalogIndex | None = None,
-        hard_negatives: bool = True, max_negatives: int = 40,
-        n_jobs: int | None = None) -> dict:
-    from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
-
+        use_rf: bool = False, n_jobs: int | None = None, **_ignored) -> dict:
     if "target_vessel_id" not in train.columns:
         raise ValueError("Training data needs target_vessel_id")
     index = index or CatalogIndex(catalog)
@@ -799,24 +862,7 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
     answers = AnswerBook(train)
     ranker = Ranker(train, catalog)
     rows, recall = _row_matrices(train, ranker, index, n_jobs=n_jobs)
-
-    def forest(n: int, seed: int):
-        return RandomForestClassifier(
-            n_estimators=n, max_depth=None, min_samples_leaf=2, max_features="sqrt",
-            class_weight="balanced_subsample", n_jobs=-1, random_state=seed,
-        )
-
-    def booster(seed: int):
-        return HistGradientBoostingClassifier(
-            max_iter=600, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=10,
-            l2_regularization=1.0, early_stopping=False, random_state=seed,
-        )
-
-    X, y = _select(rows, max_negatives)
-    stage1 = forest(max(100, n_estimators // 2), random_state).fit(X, y)
-    if hard_negatives:
-        X, y = _select(rows, max_negatives, scorer=lambda M: stage1.predict_proba(M)[:, 1])
-    models = [forest(n_estimators, random_state + 1).fit(X, y), booster(random_state + 2).fit(X, y)]
+    models = _fit_models(rows, n_estimators=n_estimators, random_state=random_state, use_rf=use_rf)
     return {
         "version": VERSION,
         "feature_names": FEATURE_NAMES,
@@ -837,8 +883,6 @@ def predict_ids(bundle: dict, queries: pd.DataFrame, index: CatalogIndex,
     answers: AnswerBook = bundle["answers"]
     ranker: Ranker = bundle["ranker"]
     models = bundle["model"]
-    if not isinstance(models, (list, tuple)):
-        models = [models]
     ids: list[str | None] = [None] * len(queries)
     sources: list[str] = ["ranker"] * len(queries)
     records = queries.to_dict("records")
@@ -853,12 +897,9 @@ def predict_ids(bundle: dict, queries: pd.DataFrame, index: CatalogIndex,
     for start in range(0, len(pending), batch_size):
         chunk = pending[start: start + batch_size]
         results = _parallel_map(_query_row, [records[p] for p in chunk], ranker, index, n_jobs)
-        scores = _score(models, np.vstack([X for X, _ in results]))
-        offset = 0
         for pos, (X, cand_idx) in zip(chunk, results):
-            local = scores[offset: offset + len(cand_idx)]
+            local = _score(models, X)
             ids[pos] = index.ids[cand_idx[int(np.argmax(local))]]
-            offset += len(cand_idx)
     return ids, sources  # type: ignore[return-value]
 
 
