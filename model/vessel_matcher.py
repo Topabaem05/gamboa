@@ -1054,6 +1054,26 @@ def _sister_mask(X: np.ndarray) -> np.ndarray | None:
     return m & (tp == tp[m].max())
 
 
+_NAME_ONLY = tuple(f for f in FEATURE_NAMES if f.startswith(("latin_", "token_", "first_token", "last_token",
+                                                             "name_score", "is_max_name_score", "is_max_latin",
+                                                             "is_max_token", "is_max_last_token")))
+
+
+def _twin_tiebreak(X: np.ndarray, cand_idx: list[int], index: "CatalogIndex", best: int) -> int:
+    """Exact twins only (Marsgracht / Maasgracht): the chosen candidate and another one agree on
+    every feature except the raw Latin-letter ones, both match the query's consonant AND vowel
+    strings exactly. No column can separate them, so the choice is made deterministic by the
+    higher catalog vessel_id. Fires on nothing else."""
+    f = _FEATURE_IDX
+    if X[best, f["cons_exact"]] != 1 or X[best, f["vow_exact"]] != 1:
+        return best
+    keep = np.asarray([i for i, n in enumerate(FEATURE_NAMES) if n not in _NAME_ONLY])
+    twins = [j for j in range(len(X)) if np.array_equal(X[j, keep], X[best, keep])]
+    if len(twins) < 2:
+        return best
+    return max(twins, key=lambda j: index.ids[cand_idx[j]])
+
+
 def choose(row: dict, X: np.ndarray, cand_idx: list[int], index: "CatalogIndex",
            scores: np.ndarray) -> int:
     """Apply the verified rules in order, then the model ranking."""
@@ -1074,7 +1094,8 @@ def choose(row: dict, X: np.ndarray, cand_idx: list[int], index: "CatalogIndex",
             forced = int(idx[int(np.argmax(local[idx]))])
     if forced is None:
         forced = _tonnage_flag_veto(X, local)
-    return forced if forced is not None else int(np.argmax(local))
+    best = forced if forced is not None else int(np.argmax(local))
+    return _twin_tiebreak(X, cand_idx, index, best)
 
 
 _FEATURE_IDX = {name: i for i, name in enumerate(FEATURE_NAMES)}
