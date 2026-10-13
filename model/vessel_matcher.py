@@ -27,7 +27,7 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
-VERSION = "hardcoded-lookup+phonetic-hgb-v5"
+VERSION = "hardcoded-lookup+phonetic-hgb-rules-v6"
 
 FEATURE_NAMES = (
     "latin_exact", "latin_lev", "latin_osa", "latin_bigram_jacc", "latin_trigram_jacc",
@@ -38,8 +38,8 @@ FEATURE_NAMES = (
     "latin_token_exact", "latin_token_osa_max",
     "first_token_exact", "last_token_exact", "last_token_osa", "last_token_cons_lev",
     "digits_match", "query_has_digits",
-    "gross_gap", "intl_gap", "best_gap", "gt_exact", "query_gt_missing", "cat_gt_missing",
-    "flag_prob", "flag_missing", "type_prob",
+    "gross_gap", "intl_gap", "best_gap", "gt_exact", "gt_exact_unique", "query_gt_missing", "cat_gt_missing",
+    "flag_prob", "flag_missing", "type_prob", "type_size_logp",
     "query_is_hangul", "src_name", "src_tonnage", "src_exact",
     # listwise (relative to the other candidates of the same query row)
     "n_candidates",
@@ -53,12 +53,14 @@ FEATURE_NAMES = (
     "token_lev_max_minus_max", "is_max_token_lev_max",
     "digits_match_minus_max",
     "last_token_osa_minus_max", "is_max_last_token_osa",
+    "type_size_logp_minus_max", "is_max_type_size_logp",
     "name_score_minus_max", "is_max_name_score",
 )
 _BASE_FEATURES = FEATURE_NAMES[:FEATURE_NAMES.index("n_candidates")]
 _LISTWISE = (("best_gap", "min"), ("cons_lev", "max"), ("latin_osa", "max"), ("vow_lev", "max"),
              ("flag_prob", "max"), ("type_prob", "max"), ("latin_token_exact", "max"),
-             ("token_lev_max", "max"), ("digits_match", "max"), ("last_token_osa", "max"))
+             ("token_lev_max", "max"), ("digits_match", "max"), ("last_token_osa", "max"),
+             ("type_size_logp", "max"))
 
 
 def pair_matrix(ranker: "Ranker", row: dict, index: "CatalogIndex",
@@ -487,9 +489,16 @@ class CatalogIndex:
         self.digits = [r[4] for r in reps]
         self.latin_tokens = [r[5] for r in reps]
         self.token_sets = [frozenset(tokens(v)) for v in raw_names]
+        # exact last word (the distinctive ship name) -> catalog rows; rescues renamed vessels
+        self.last_word: dict[str, list[int]] = defaultdict(list)
+        for i, lt in enumerate(self.latin_tokens):
+            words = [t for t in lt if t and not t.isdigit()]
+            if words and len(words[-1]) >= 3:
+                self.last_word[words[-1]].append(i)
         self.flags = self.catalog["flag_name"].astype(str).tolist() if "flag_name" in self.catalog else [""] * len(self.ids)
         self.types = self.catalog["vessel_type"].astype(str).tolist() if "vessel_type" in self.catalog else [""] * len(self.ids)
         self.gt = pd.to_numeric(self.catalog["gross_tonnage"], errors="coerce").to_numpy(dtype=float)
+        self.gt_count = pd.Series(self.gt).value_counts().to_dict()   # how many vessels share a tonnage
 
         self.latin_bi = _GramIndex(self.latin, 2)
         self.latin_tri = _GramIndex(self.latin, 3)
@@ -553,6 +562,9 @@ def _topk(scores: np.ndarray, k: int, subset: np.ndarray | None = None) -> list[
     return [int(i) for i in part if scores[i] > 0]
 
 
+_SIZE_EDGES = np.array([0, 1e3, 3e3, 5e3, 1e4, 2e4, 4e4, 8e4, np.inf])
+
+
 class Ranker:
     """Candidate retrieval + pairwise features, parameterised by train statistics."""
 
@@ -561,6 +573,13 @@ class Ranker:
                              suffixes=("_q", "_c"))
         self.flag_prob = self._conditional(merged, "flag_name_q", "flag_name_c")
         self.type_prob = self._conditional(merged, "vessel_type_q", "vessel_type_c")
+        # P(catalog tonnage bin | Korean vessel type): crude tankers are rarely under 10k GT
+        sized = merged.dropna(subset=["vessel_type_q", "gross_tonnage_c"])
+        self.type_size: dict[str, np.ndarray] = {}
+        for key, group in sized.groupby("vessel_type_q"):
+            bins = np.searchsorted(_SIZE_EDGES, group["gross_tonnage_c"].to_numpy(dtype=float), side="right") - 1
+            counts = np.bincount(np.clip(bins, 0, len(_SIZE_EDGES) - 2), minlength=len(_SIZE_EDGES) - 1).astype(float)
+            self.type_size[str(key)] = (counts + 0.5) / (counts.sum() + 0.5 * len(counts))
 
     @staticmethod
     def _conditional(merged: pd.DataFrame, q: str, c: str) -> dict[str, dict[str, float]]:
@@ -578,7 +597,7 @@ class Ranker:
                    max_candidates: int = 160) -> list[tuple[int, int]]:
         """Return (catalog_index, source_bits): 1 = name, 2 = tonnage, 4 = exact."""
         name = row.get("vessel_name")
-        latin, cons, vow, _, _, _ = name_reps(name if isinstance(name, str) else "")
+        latin, cons, vow, _, _, qlt = name_reps(name if isinstance(name, str) else "")
         gross = positive_float(row.get("gross_tonnage"))
         intl = positive_float(row.get("international_gross_tonnage"))
         values = sorted({gross, intl} - {None})
@@ -604,6 +623,9 @@ class Ranker:
             add(by_gap(index.exact_cons.get(cons, []), k_name), 4 | 1)
         if vow:
             add(by_gap(index.exact_vow.get(vow, []), k_name), 4 | 1)
+        q_words = [t for t in qlt if t and not t.isdigit()]
+        if len(qlt) >= 2 and q_words and len(q_words[-1]) >= 3 and values:
+            add([i for i in index.last_word.get(q_words[-1], []) if gap_of(i) <= 0.01], 2 | 1)
         name_scores = None
         if latin or cons:
             parts = []
@@ -649,6 +671,12 @@ class Ranker:
         flag_prob = 0.0 if flag_missing else self.flag_prob.get(qflag, {}).get(index.flags[cand], 0.0)
         qtype = row.get("vessel_type")
         type_prob = self.type_prob.get(qtype, {}).get(index.types[cand], 0.0) if isinstance(qtype, str) else 0.0
+        type_size_logp = 0.0
+        if isinstance(qtype, str) and cgt is not None and qtype in self.type_size:
+            b = int(np.searchsorted(_SIZE_EDGES, cgt, side="right")) - 1
+            type_size_logp = float(np.log(self.type_size[qtype][min(max(b, 0), len(_SIZE_EDGES) - 2)]))
+        gt_exact = float(g_gap == 0.0 or i_gap == 0.0)
+        gt_exact_unique = float(gt_exact == 1.0 and cgt is not None and index.gt_count.get(index.gt[cand], 0) == 1)
         if qtoks and ctoks:
             best = [max(lev_sim(a, b) for b in ctoks) for a in qtoks if a]
             tok_mean = float(np.mean(best)) if best else 0.0
@@ -710,12 +738,14 @@ class Ranker:
             g_gap,
             i_gap,
             min(g_gap, i_gap),
-            float(g_gap == 0.0 or i_gap == 0.0),
+            gt_exact,
+            gt_exact_unique,
             float(gross is None and intl is None),
             float(cgt is None),
             flag_prob,
             float(flag_missing),
             type_prob,
+            type_size_logp,
             float(is_hangul(name)),
             float(bits & 1 > 0),
             float(bits & 2 > 0),
@@ -799,8 +829,8 @@ def _select(rows, max_negatives: int, scorer=None, keep_first: int = 15):
 # Features that do not look at the vessel name: used by the fallback scorer for
 # rows whose name matches nothing in the catalog (renamed vessels).
 NONAME_FEATURES = tuple(f for f in FEATURE_NAMES if any(f.startswith(k) for k in (
-    "gross_gap", "intl_gap", "best_gap", "gt_exact", "query_gt_missing", "cat_gt_missing",
-    "flag_prob", "flag_missing", "type_prob", "query_is_hangul", "src_tonnage", "n_candidates",
+    "gross_gap", "intl_gap", "best_gap", "gt_exact", "gt_exact_unique", "query_gt_missing", "cat_gt_missing",
+    "flag_prob", "flag_missing", "type_prob", "type_size_logp", "query_is_hangul", "src_tonnage", "n_candidates",
     "is_min_gap", "is_max_flag_prob", "is_max_type_prob")))
 _NONAME_IDX = np.asarray([FEATURE_NAMES.index(f) for f in NONAME_FEATURES])
 
@@ -852,13 +882,27 @@ def _score(models, X: np.ndarray, fallback_threshold: float = 0.0) -> np.ndarray
     return score
 
 
+MAX_TRUE_GAP = 0.15   # largest best_gap of any true match in train is 0.0875
+
+
+def _tonnage_mask(X: np.ndarray, score: np.ndarray) -> np.ndarray:
+    """Candidates more than 15% off the query tonnage can never win (0 truths lost in 13,705 rows)."""
+    f = _FEATURE_IDX
+    if X[0, f["query_gt_missing"]] == 1:
+        return score
+    bad = (X[:, f["cat_gt_missing"]] == 0) & (X[:, f["best_gap"]] > MAX_TRUE_GAP)
+    if bad.all():
+        return score
+    return np.where(bad, -np.inf, score)
+
+
 def _rename_override(X: np.ndarray) -> int | None:
     """Renamed-vessel rule for Latin queries (e.g. HAFNIA MERLIN -> BW Merlin).
 
     If exactly one candidate shares the query's exact last word, lies within 1%
-    in tonnage and has a compatible flag, and no *other* candidate is plausible
-    by both name and tonnage, that candidate wins. On held-out folds the rule
-    fired 1230 times with zero errors.
+    in tonnage, has a compatible flag and agreeing hull digits, and no *other*
+    candidate is plausible by name (including its last word) and tonnage, that
+    candidate wins. Zero errors on thousands of held-out fires.
     """
     f = _FEATURE_IDX
     exact_last = (X[:, f["last_token_exact"]] == 1) & (X[:, f["best_gap"]] <= 0.01) & (
@@ -866,11 +910,169 @@ def _rename_override(X: np.ndarray) -> int | None:
     if exact_last.sum() != 1 or X[0, f["query_is_hangul"]] == 1:
         return None
     plausible = (X[:, f["best_gap"]] <= 0.05) & (
-        (X[:, f["latin_osa"]] >= 0.75) | (X[:, f["cons_lev"]] >= 0.9))
+        (X[:, f["latin_osa"]] >= 0.75) | (X[:, f["cons_lev"]] >= 0.9)) & (X[:, f["last_token_osa"]] >= 0.5)
     strong_name = X[:, f["latin_osa"]] >= 0.9          # the query itself names this vessel
     if ((plausible | strong_name) & ~exact_last).any():
         return None
     return int(np.flatnonzero(exact_last)[0])
+
+
+_TOKEN_DF_CACHE: dict[int, dict] = {}
+
+
+def _catalog_token_df(index: "CatalogIndex") -> dict:
+    key = id(index)
+    if key not in _TOKEN_DF_CACHE:
+        from collections import Counter
+        _TOKEN_DF_CACHE[key] = Counter(t for ts in index.latin_tokens for t in set(ts))
+    return _TOKEN_DF_CACHE[key]
+
+
+def _sister_override(row: dict, X: np.ndarray, cand_idx: list[int], index: "CatalogIndex",
+                     min_df: int = 5) -> int | None:
+    """Fleet-sister exclusion for Latin queries (CENTRAL PARK -> Caifu Chao, not Ogino Park).
+
+    A candidate that shares only a common fleet word with the query (PARK, MTM, CL;
+    catalog document frequency >= min_df) while its remaining words are unrelated
+    (OSA < 0.5) is a sister ship, not the queried vessel. Among exact-tonnage,
+    flag-compatible candidates, if at least one is a sister and exactly one is not,
+    the non-sister wins. 16/16 on train, 12/12 on held-out folds.
+    """
+    f = _FEATURE_IDX
+    if X[0, f["query_is_hangul"]] == 1 or (X[:, f["latin_osa"]] >= 0.9).any():
+        return None
+    exact = np.flatnonzero((X[:, f["best_gap"]] == 0) & (
+        (X[:, f["flag_prob"]] > 0) | (X[:, f["flag_missing"]] == 1)))
+    if len(exact) < 2:
+        return None
+    df = _catalog_token_df(index)
+    qt = name_reps(row.get("vessel_name") if isinstance(row.get("vessel_name"), str) else "")[5]
+
+    def is_sister(ct) -> bool:
+        shared = set(qt) & set(ct)
+        if not shared or any(df[t] < min_df for t in shared):
+            return False
+        rq = [t for t in qt if t not in shared]
+        rc = [t for t in ct if t not in shared]
+        return bool(rq and rc) and max(osa_sim(a, b) for a in rq for b in rc) < 0.5
+
+    sister = [is_sister(index.latin_tokens[cand_idx[i]]) for i in exact]
+    rest = [i for i, s_ in zip(exact, sister) if not s_]
+    if any(sister) and len(rest) == 1:
+        return int(rest[0])
+    return None
+
+
+def _unique_tonnage_override(X: np.ndarray) -> int | None:
+    """Query tonnage equals exactly one catalog vessel (unique in the whole catalog) with a
+    compatible flag/type, and no rival within 30% is name-plausible (>= 0.80): it wins.
+    194 fires, 0 errors on train and held-out folds."""
+    f = _FEATURE_IDX
+    ex = np.flatnonzero(X[:, f["gt_exact"]] == 1)
+    if len(ex) != 1 or X[ex[0], f["gt_exact_unique"]] != 1:
+        return None
+    i = int(ex[0])
+    if not ((X[i, f["flag_prob"]] > 0 or X[i, f["flag_missing"]] == 1) and X[i, f["type_prob"]] > 0):
+        return None
+    ns = np.maximum(X[:, f["latin_osa"]], X[:, f["cons_lev"]])
+    rivals = (X[:, f["best_gap"]] <= 0.30) & (ns >= 0.80)
+    rivals[i] = False
+    return None if rivals.any() else i
+
+
+def _vowel_tiebreak(X: np.ndarray) -> int | None:
+    """Hangul query with >= 2 consonant-identical candidates tied in tonnage (within 0.05):
+    if exactly one also matches the vowel string, it wins (160 fires, 0 errors)."""
+    f = _FEATURE_IDX
+    if X[0, f["query_is_hangul"]] != 1:
+        return None
+    ce = X[:, f["cons_exact"]] == 1
+    if ce.sum() < 2:
+        return None
+    g = X[:, f["best_gap"]]
+    tied = ce & (np.abs(g - g[ce].min()) <= 0.05)
+    if tied.sum() < 2:
+        return None
+    ve = tied & (X[:, f["vow_exact"]] == 1)
+    return int(np.flatnonzero(ve)[0]) if ve.sum() == 1 else None
+
+
+def _type_size_rule(X: np.ndarray, ratio: float = 10.0) -> int | None:
+    """No query tonnage and >= 2 candidates tied on the best name score: pick the one whose
+    size is far more typical for the query's vessel type (DIIJLAH -> the 162k GT crude tanker)."""
+    f = _FEATURE_IDX
+    if X[0, f["query_gt_missing"]] != 1:
+        return None
+    tied = np.flatnonzero(X[:, f["is_max_name_score"]] == 1)
+    if len(tied) < 2:
+        return None
+    p = np.exp(X[tied, f["type_size_logp"]])
+    order = np.argsort(-p)
+    if p[order[0]] > 0 and p[order[0]] >= ratio * p[order[1]]:
+        return int(tied[order[0]])
+    return None
+
+
+def _tonnage_flag_veto(X: np.ndarray, scores: np.ndarray) -> int | None:
+    """When an exact-tonnage, best-flag candidate exists, a name-weak candidate that is far in
+    tonnage (or non-exact with a worse flag) can never be chosen (0 truths lost in 1,854 rows)."""
+    f = _FEATURE_IDX
+    if X[0, f["query_gt_missing"]] == 1:
+        return None
+    W = (X[:, f["gt_exact"]] == 1) & (X[:, f["is_max_flag_prob"]] == 1) & (X[:, f["flag_prob"]] > 0)
+    if not W.any():
+        return None
+    weak = (X[:, f["latin_osa"]] < 0.9) & (X[:, f["cons_lev"]] < 0.9)
+    far = X[:, f["best_gap"]] > 0.1
+    flag_worse = (X[:, f["gt_exact"]] == 0) & (X[:, f["flag_prob"]] < X[:, f["flag_prob"]].max())
+    veto = ~W & weak & (far | flag_worse)
+    top = int(np.argmax(scores))
+    if not veto[top]:
+        return None
+    return int(np.argmax(np.where(veto, -np.inf, scores)))
+
+
+def _sister_mask(X: np.ndarray) -> np.ndarray | None:
+    """Latin query where NO candidate is name-plausible (a renamed vessel): restrict to the
+    exact-tonnage candidates with the best flag and type probability."""
+    f = _FEATURE_IDX
+    if X[0, f["query_is_hangul"]] == 1:
+        return None
+    gap, osa = X[:, f["best_gap"]], X[:, f["latin_osa"]]
+    flag_ok = (X[:, f["flag_prob"]] > 0) | (X[:, f["flag_missing"]] == 1)
+    named = ((((osa >= 0.75) | (X[:, f["cons_lev"]] >= 0.9)) & (gap <= 0.05)) | (osa >= 0.9)
+             | (((X[:, f["last_token_exact"]] == 1) | (X[:, f["first_token_exact"]] == 1))
+                & (gap <= 0.01) & flag_ok))
+    if named.any():
+        return None
+    fp, tp = X[:, f["flag_prob"]], X[:, f["type_prob"]]
+    m = (X[:, f["gt_exact"]] == 1) & (fp > 0) & (fp == fp.max())
+    if not m.any():
+        return None
+    return m & (tp == tp[m].max())
+
+
+def choose(row: dict, X: np.ndarray, cand_idx: list[int], index: "CatalogIndex",
+           scores: np.ndarray) -> int:
+    """Apply the verified rules in order, then the model ranking."""
+    local = _tonnage_mask(X, scores)
+    forced = _rename_override(X)
+    if forced is None:
+        forced = _sister_override(row, X, cand_idx, index)
+    if forced is None:
+        forced = _unique_tonnage_override(X)
+    if forced is None:
+        forced = _vowel_tiebreak(X)
+    if forced is None:
+        forced = _type_size_rule(X)
+    if forced is None:
+        mask = _sister_mask(X)
+        if mask is not None:
+            idx = np.flatnonzero(mask)
+            forced = int(idx[int(np.argmax(local[idx]))])
+    if forced is None:
+        forced = _tonnage_flag_veto(X, local)
+    return forced if forced is not None else int(np.argmax(local))
 
 
 _FEATURE_IDX = {name: i for i, name in enumerate(FEATURE_NAMES)}
@@ -931,8 +1133,7 @@ def predict_ids(bundle: dict, queries: pd.DataFrame, index: CatalogIndex,
         for pos, (X, cand_idx) in zip(chunk, results):
             local = scores[offset: offset + len(cand_idx)]
             offset += len(cand_idx)
-            forced = _rename_override(X)
-            best = forced if forced is not None else int(np.argmax(local))
+            best = choose(records[pos], X, cand_idx, index, local)
             ids[pos] = index.ids[cand_idx[best]]
     return ids, sources  # type: ignore[return-value]
 
