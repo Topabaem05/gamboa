@@ -494,25 +494,32 @@ class CatalogIndex:
         self.vow_bi = _GramIndex(self.vow, 2)
         self.exact_latin: dict[str, list[int]] = defaultdict(list)
         self.exact_cons: dict[str, list[int]] = defaultdict(list)
-        for i, (l, c) in enumerate(zip(self.latin, self.cons)):
+        self.exact_vow: dict[str, list[int]] = defaultdict(list)
+        for i, (l, c, v) in enumerate(zip(self.latin, self.cons, self.vow)):
             if l:
                 self.exact_latin[l].append(i)
             if c:
                 self.exact_cons[c].append(i)
+            if v:
+                self.exact_vow[v].append(i)
 
         valid = np.flatnonzero(np.isfinite(self.gt) & (self.gt > 0))
         order = np.argsort(self.gt[valid], kind="mergesort")
         self.sorted_gt_indices = valid[order]
         self.sorted_gt_values = self.gt[self.sorted_gt_indices]
 
-    def nearest_gt(self, value: float | None, count: int) -> list[int]:
+    def nearest_gt(self, value: float | None, count: int, max_ties: int = 60) -> list[int]:
+        """All catalog rows with exactly this tonnage (up to ``max_ties``) plus the
+        ``count`` nearest other rows."""
         if value is None or len(self.sorted_gt_values) == 0:
             return []
-        pos = int(np.searchsorted(self.sorted_gt_values, value))
-        lo, hi = max(0, pos - count), min(len(self.sorted_gt_values), pos + count)
-        idx = self.sorted_gt_indices[lo:hi]
-        order = np.argsort(np.abs(self.gt[idx] - value), kind="mergesort")[:count]
-        return [int(i) for i in idx[order]]
+        lo_eq = int(np.searchsorted(self.sorted_gt_values, value, side="left"))
+        hi_eq = int(np.searchsorted(self.sorted_gt_values, value, side="right"))
+        exact = [int(i) for i in self.sorted_gt_indices[lo_eq:hi_eq][:max_ties]]
+        lo, hi = max(0, lo_eq - count), min(len(self.sorted_gt_values), hi_eq + count)
+        others = np.concatenate([self.sorted_gt_indices[lo:lo_eq], self.sorted_gt_indices[hi_eq:hi]])
+        order = np.argsort(np.abs(self.gt[others] - value), kind="mergesort")[:count]
+        return exact + [int(i) for i in others[order]]
 
     def gt_window(self, value: float | None, tolerance: float) -> np.ndarray:
         if value is None or len(self.sorted_gt_values) == 0:
@@ -562,15 +569,20 @@ class Ranker:
 
     # ---- retrieval ------------------------------------------------------- #
 
-    def candidates(self, row: dict, index: CatalogIndex, k_name: int = 20,
-                   k_window: int = 25, k_near: int = 10, tolerance: float = 0.06,
-                   max_candidates: int = 90) -> list[tuple[int, int]]:
+    def candidates(self, row: dict, index: CatalogIndex, k_name: int = 30,
+                   k_window: int = 30, k_near: int = 10, tolerance: float = 0.06,
+                   max_candidates: int = 160) -> list[tuple[int, int]]:
         """Return (catalog_index, source_bits): 1 = name, 2 = tonnage, 4 = exact."""
         name = row.get("vessel_name")
         latin, cons, vow, _, _, _ = name_reps(name if isinstance(name, str) else "")
         gross = positive_float(row.get("gross_tonnage"))
         intl = positive_float(row.get("international_gross_tonnage"))
+        values = sorted({gross, intl} - {None})
         output: dict[int, int] = {}
+
+        def gap_of(i: int) -> float:
+            cgt = positive_float(index.gt[i])
+            return min((relative_gap(v, cgt) for v in values), default=2.0)
 
         def add(indices, bit):
             for i in indices:
@@ -579,10 +591,15 @@ class Ranker:
                 elif len(output) < max_candidates:
                     output[i] = bit
 
+        def by_gap(indices, limit):
+            return sorted(indices, key=gap_of)[:limit]
+
         if latin:
-            add(index.exact_latin.get(latin, [])[:k_name], 4 | 1)
+            add(by_gap(index.exact_latin.get(latin, []), k_name), 4 | 1)
         if cons:
-            add(index.exact_cons.get(cons, [])[:k_name], 4 | 1)
+            add(by_gap(index.exact_cons.get(cons, []), k_name), 4 | 1)
+        if vow:
+            add(by_gap(index.exact_vow.get(vow, []), k_name), 4 | 1)
         name_scores = None
         if latin or cons:
             parts = []
@@ -597,7 +614,8 @@ class Ranker:
             for p in parts:
                 add(_topk(p, k_name), 1)
             name_scores = np.maximum.reduce(parts)
-        for value in sorted({gross, intl} - {None}):
+            add(_topk(name_scores, k_name), 1)
+        for value in values:
             add(index.nearest_gt(value, k_near), 2)
             window = index.gt_window(value, tolerance)
             if len(window) and name_scores is not None:
