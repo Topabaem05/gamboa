@@ -52,6 +52,7 @@ FEATURE_NAMES = (
     "latin_token_exact_minus_max", "is_max_latin_token_exact",
     "token_lev_max_minus_max", "is_max_token_lev_max",
     "digits_match_minus_max",
+    "last_token_osa_minus_max", "is_max_last_token_osa",
     "name_score_minus_max", "is_max_name_score",
 )
 _BASE_FEATURES = FEATURE_NAMES[:FEATURE_NAMES.index("n_candidates")]
