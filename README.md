@@ -55,6 +55,6 @@ scripts/make_submission.sh      # -> submission.zip (DACON 코드 제출용)
 |---|---|---|---|---|
 | train.csv 재현 (정답표 ON) | 1.000 | 1.000 | 1.000 | **1.000** |
 | DACON 베이스라인(rf.pkl) train 재현 | – | 0.326 | 0.984 | 0.523 |
-| 미학습 선박 GroupKFold 5-fold (정답표 OFF, fallback만) | CV_ACC | CV_HAN | CV_NON | CV_W |
+| 미학습 선박 GroupKFold 5-fold (정답표 OFF, fallback만) | 0.953 | 0.657 | 0.985 | 0.755 |
 
 주의: 비공개 test의 선박이 train에 없으면 정답표가 적중하지 않으므로 실제 점수는 fallback 성능에 좌우됩니다.
