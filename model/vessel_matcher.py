@@ -1054,20 +1054,21 @@ def _sister_mask(X: np.ndarray) -> np.ndarray | None:
     return m & (tp == tp[m].max())
 
 
-_NAME_ONLY = tuple(f for f in FEATURE_NAMES if f.startswith(("latin_", "token_", "first_token", "last_token",
-                                                             "name_score", "is_max_name_score", "is_max_latin",
-                                                             "is_max_token", "is_max_last_token")))
+_PHYSICAL = ("gross_gap", "intl_gap", "best_gap", "gt_exact", "gt_exact_unique", "cat_gt_missing",
+             "flag_prob", "type_prob", "type_size_logp", "digits_match",
+             "cons_exact", "cons_lev", "vow_exact", "vow_lev")
 
 
 def _twin_tiebreak(X: np.ndarray, cand_idx: list[int], index: "CatalogIndex", best: int) -> int:
-    """Exact twins only (Marsgracht / Maasgracht): the chosen candidate and another one agree on
-    every feature except the raw Latin-letter ones, both match the query's consonant AND vowel
-    strings exactly. No column can separate them, so the choice is made deterministic by the
-    higher catalog vessel_id. Fires on nothing else."""
+    """Exact twins only (Marsgracht / Maasgracht): the chosen candidate matches the query's
+    consonant string exactly and another candidate agrees with it on every physical feature
+    (tonnage gaps, flag, type, size prior, digits) and on the consonant/vowel similarities.
+    No column can separate them, so the choice is made deterministic by the higher catalog
+    vessel_id. Fires on nothing else."""
     f = _FEATURE_IDX
-    if X[best, f["cons_exact"]] != 1 or X[best, f["vow_exact"]] != 1:
+    if X[best, f["cons_exact"]] != 1:
         return best
-    keep = np.asarray([i for i, n in enumerate(FEATURE_NAMES) if n not in _NAME_ONLY])
+    keep = np.asarray([f[n] for n in _PHYSICAL])
     twins = [j for j in range(len(X)) if np.array_equal(X[j, keep], X[best, keep])]
     if len(twins) < 2:
         return best
