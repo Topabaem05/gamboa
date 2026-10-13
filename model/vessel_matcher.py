@@ -161,7 +161,10 @@ _VOWELS = set("AEIOU")
 
 def _english_phones(word: str) -> list[str]:
     """Map an upper-case Latin word to phone classes (vowels lower-case)."""
+    if _INITIALISM.match(word):                               # KS, CNC, JBU, MSC ... spelled out
+        return [p for ch in word for p in _LETTER_PHONES[ch]]
     w = word
+    w = re.sub(r"^H(?=ON|OUR)", "", w)                          # Honour, Hour
     w = re.sub(r"([BDFGHJ-NP-TVWXZ])\1", r"\1", w)          # double consonants (not CC)
     w = re.sub(r"(?<=[AEIOU])GH", "", w)                       # Highway, Eight
     w = re.sub(r"^GH", "K", w)                                  # Ghazal
@@ -240,8 +243,18 @@ _LETTER_NAMES = {
     "케이": "K", "에스": "S", "브이": "V", "엑스": "X", "와이": "Y", "제트": "Z",
     "지드": "Z", "비": "B", "씨": "C", "디": "D", "이": "E", "지": "G", "엘": "L",
     "엠": "M", "엔": "N", "앤": "N", "오": "O", "피": "P", "큐": "Q", "알": "R",
-    "티": "T", "유": "U", "쥐": "G",
+    "티": "T", "유": "U", "쥐": "G", "시": "C",
 }
+# How Korean spells out Latin letter names, as phones (consonant classes upper, vowels lower)
+_LETTER_PHONES = {
+    "A": ["a"], "B": ["B", "i"], "C": ["S", "i"], "D": ["D", "i"], "E": ["i"], "F": ["e", "P"],
+    "G": ["S", "i"], "H": ["a", "i", "C"], "I": ["a", "i"], "J": ["S", "a", "i"],
+    "K": ["K", "a", "i"], "L": ["e", "R"], "M": ["e", "M"], "N": ["e", "N"], "O": ["o"],
+    "P": ["P", "i"], "Q": ["K", "u"], "R": ["a", "R"], "S": ["e", "S"], "T": ["T", "i"],
+    "U": ["u"], "V": ["B", "u", "i"], "W": ["D", "e", "B", "u", "R", "u"], "X": ["e", "K", "S"],
+    "Y": ["a", "i"], "Z": ["S", "e", "T"],
+}
+_INITIALISM = re.compile(r"^[B-DF-HJ-NP-TV-Z]{2,4}$")
 _LETTER_KEYS = sorted(_LETTER_NAMES, key=len, reverse=True)
 
 
