@@ -26,7 +26,7 @@ def main() -> None:
     parser.add_argument("--train", default="data/train.csv")
     parser.add_argument("--catalog", default="data/vessel_catalog.csv")
     parser.add_argument("--out", default="model/bundle.pkl")
-    parser.add_argument("--n-estimators", type=int, default=200)
+    parser.add_argument("--n-estimators", type=int, default=300)
     args = parser.parse_args()
 
     train = pd.read_csv(args.train, encoding="utf-8-sig")

@@ -30,20 +30,22 @@ def main() -> None:
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--n-estimators", type=int, default=120)
     parser.add_argument("--skip-cv", action="store_true")
+    parser.add_argument("--skip-replay", action="store_true")
     args = parser.parse_args()
 
     train = pd.read_csv(args.train, encoding="utf-8-sig")
     catalog = pd.read_csv(args.catalog, encoding="utf-8-sig")
     index = CatalogIndex(catalog)
 
-    bundle = joblib.load(args.bundle)
-    ids, sources = predict_ids(bundle, train, index)
-    full = weighted_accuracy(train, ids)
-    print("[replay] train.csv through bundle (answer book ON):", full,
-          "| sources:", {s: sources.count(s) for s in set(sources)})
-    if full["accuracy"] < 1.0:
-        wrong = train[np.asarray(ids) != train["target_vessel_id"].astype(str).to_numpy()]
-        print(wrong.head(20).to_string())
+    if not args.skip_replay:
+        bundle = joblib.load(args.bundle)
+        ids, sources = predict_ids(bundle, train, index)
+        full = weighted_accuracy(train, ids)
+        print("[replay] train.csv through bundle (answer book ON):", full,
+              "| sources:", {s: sources.count(s) for s in set(sources)})
+        if full["accuracy"] < 1.0:
+            wrong = train[np.asarray(ids) != train["target_vessel_id"].astype(str).to_numpy()]
+            print(wrong.head(20).to_string())
 
     if args.skip_cv:
         return
@@ -51,10 +53,15 @@ def main() -> None:
     results = []
     for k, (tr_idx, va_idx) in enumerate(gkf.split(train, groups=train["target_vessel_id"])):
         started = time.time()
-        fold_bundle = fit(train.iloc[tr_idx], catalog, n_estimators=args.n_estimators)
+        fold_bundle = fit(train.iloc[tr_idx], catalog, n_estimators=args.n_estimators, index=index)
         va = train.iloc[va_idx]
         pred, _ = predict_ids(fold_bundle, va, index, use_answers=False)
         metrics = weighted_accuracy(va, pred)
+        pred_arr = np.asarray(pred)
+        wrong_mask = pred_arr != va["target_vessel_id"].astype(str).to_numpy()
+        for r, p in zip(va[wrong_mask].to_dict("records"), pred_arr[wrong_mask]):
+            print(f"   miss: {r['vessel_name']!r} gt={r['gross_tonnage']} flag={r['flag_name']} "
+                  f"type={r['vessel_type']} true={r['target_vessel_id']} pred={p}")
         metrics["candidate_recall_train"] = fold_bundle["candidate_recall"]
         results.append(metrics)
         print(f"[cv fold {k}] {metrics} ({time.time() - started:.0f}s)")

@@ -1,127 +1,298 @@
-"""Vessel entity matcher for the DACON vessel-identification competition.
+"""Vessel entity matcher for the DACON vessel-identification competition (v2).
 
 Two layers:
 
-1. ``AnswerBook`` — hard-coded answers memorised from the official ``train.csv``.
-   ``call_sign`` and ``vessel_name`` each map one-to-one onto ``target_vessel_id``
-   in the training data, so an exact lookup reproduces every training label.
-2. ``Ranker`` — candidate retrieval over ``vessel_catalog.csv`` plus a
-   RandomForest pairwise scorer, used for rows the answer book has never seen.
+1. ``AnswerBook`` - hard-coded answers memorised from the official ``train.csv``
+   (``call_sign`` and ``vessel_name`` each map one-to-one onto the target).
+2. ``Ranker`` - candidate retrieval over ``vessel_catalog.csv`` and a
+   RandomForest pairwise scorer for rows the answer book has never seen.
 
-Every query row is processed on its own; no feature looks at other evaluation
+Korean (Hangul) names are transliterations of the catalog's Latin names, so
+both sides are mapped into a shared *phonetic class* alphabet (e.g. L/R -> R,
+B/V -> B, soft C/J/Z/S -> S, post-vocalic R dropped) before comparison.
+
+Every query row is processed on its own; nothing looks at other evaluation
 rows or at the evaluation distribution.
 """
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from heapq import nlargest
+from collections import defaultdict
+from functools import lru_cache
 import re
 import unicodedata
 
 import numpy as np
 import pandas as pd
 
-VERSION = "hardcoded-lookup+rf-v1"
+VERSION = "hardcoded-lookup+phonetic-rf-v2"
 
 FEATURE_NAMES = (
-    "name_exact",
-    "name_bigram_jaccard",
-    "name_trigram_jaccard",
-    "name_prefix_ratio",
-    "name_length_ratio",
-    "skeleton_exact",
-    "skeleton_bigram_jaccard",
-    "token_overlap",
-    "gross_tonnage_gap",
-    "international_gross_tonnage_gap",
-    "best_tonnage_gap",
-    "query_tonnage_missing",
-    "catalog_tonnage_missing",
-    "flag_prob",
-    "flag_missing",
-    "type_prob",
-    "query_is_hangul",
-    "from_name_index",
-    "from_tonnage_index",
+    "latin_exact", "latin_lev", "latin_bigram_jacc", "latin_trigram_jacc",
+    "latin_prefix_ratio", "latin_length_ratio",
+    "cons_exact", "cons_lev", "cons_bigram_jacc", "cons_trigram_jacc", "cons_length_ratio",
+    "vow_exact", "vow_lev", "vow_bigram_jacc",
+    "token_lev_mean", "token_lev_min", "token_count_diff", "token_overlap",
+    "digits_match", "query_has_digits",
+    "gross_gap", "intl_gap", "best_gap", "gt_exact", "query_gt_missing", "cat_gt_missing",
+    "flag_prob", "flag_missing", "type_prob",
+    "query_is_hangul", "src_name", "src_tonnage", "src_exact",
 )
 
 # --------------------------------------------------------------------------- #
-# Text normalisation and Hangul romanisation
+# Hangul decomposition
 # --------------------------------------------------------------------------- #
 
-_INITIALS = ["g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "",
+# Phonetic classes of Hangul jamo (initial, medial, final)
+_INIT_CLS = ["K", "K", "N", "D", "D", "R", "M", "B", "B", "S", "S", "",
+             "S", "S", "C", "K", "T", "P", "H"]
+_MED_VOW = ["A", "E", "A", "E", "O", "E", "O", "E", "O", "A", "E",
+            "E", "O", "U", "O", "E", "I", "U", "", "I", "I"]
+_FIN_CLS = ["", "K", "K", "K", "N", "N", "N", "T", "R", "K", "M", "P", "R",
+            "R", "P", "R", "M", "P", "P", "T", "T", "N", "T", "T", "K", "T",
+            "P", "T"]
+# Revised romanisation (for a Latin-looking key)
+_INIT_ROM = ["g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "",
              "j", "jj", "ch", "k", "t", "p", "h"]
-_MEDIALS = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae",
+_MED_ROM = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae",
             "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i"]
-_FINALS = ["", "k", "k", "k", "n", "n", "n", "t", "l", "lk", "lm", "lp", "ls",
-           "lt", "lp", "l", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t",
-           "p", "t"]
+_FIN_ROM = ["", "k", "k", "k", "n", "n", "n", "t", "l", "lk", "lm", "lp", "ls",
+            "lt", "lp", "l", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t",
+            "p", "t"]
 
 
 def is_hangul(value: object) -> bool:
     return isinstance(value, str) and any("가" <= ch <= "힣" for ch in value)
 
 
-def romanize(text: str) -> str:
-    """Revised-Romanisation style transliteration of Hangul syllables."""
-    out: list[str] = []
+def _syllables(text: str):
     for ch in text:
         code = ord(ch)
         if 0xAC00 <= code <= 0xD7A3:
             code -= 0xAC00
-            out.append(_INITIALS[code // 588])
-            out.append(_MEDIALS[(code % 588) // 28])
-            out.append(_FINALS[code % 28])
+            yield True, code // 588, (code % 588) // 28, code % 28, ch
         else:
-            out.append(ch)
+            yield False, 0, 0, 0, ch
+
+
+def romanize(text: str) -> str:
+    out = []
+    for is_syl, i, m, f, ch in _syllables(text):
+        out.append(_INIT_ROM[i] + _MED_ROM[m] + _FIN_ROM[f] if is_syl else ch)
     return "".join(out)
 
 
-def normalize_name(value: object) -> str:
-    """Uppercase alphanumerics only; Hangul is kept (used as an exact key)."""
+def _clean(value: object) -> str:
     if not isinstance(value, str):
         return ""
     value = unicodedata.normalize("NFKC", value).upper()
-    return "".join(ch for ch in value if ch.isalnum())
+    value = re.sub(r"제\s*(\d+)", r"NO\1", value)        # 제7하나 -> NO7하나
+    if len(re.findall(r"[가-힣]", value)) >= 3:
+        value = re.sub(r"호\s*$", "", value)             # trailing 호 (ship suffix)
+    # "No. 2 Asian Pioneer" / "Ocean Pioneer No. 2" / 제2 -> move the hull number to the end
+    numbers = re.findall(r"NO\s*\.?\s*(\d+)", value)
+    if numbers:
+        value = re.sub(r"NO\s*\.?\s*\d+", " ", value)
+        value = value.strip() + "".join(f" NO{n}" for n in numbers)
+    return value.strip()
+
+
+def tokens(value: object) -> list[str]:
+    value = _clean(value)
+    return [t for t in re.split(r"[^0-9A-Z가-힣]+", value) if t]
 
 
 def latin_key(value: object) -> str:
-    """Latin-only comparison key: Hangul is romanised, ``제N`` becomes ``NON``."""
-    if not isinstance(value, str):
-        return ""
-    value = unicodedata.normalize("NFKC", value)
-    value = re.sub(r"제\s*(\d+)", r"NO\1", value)
-    value = re.sub(r"\s*호$", "", value.strip())  # trailing 호 (ship suffix)
-    value = romanize(value).upper()
-    return "".join(ch for ch in value if ch.isalnum())
+    """Latin-only comparison key (Hangul romanised), alphanumerics only."""
+    return "".join(ch for ch in romanize(_clean(value)).upper() if ch.isalnum())
 
 
-_SKELETON_MAP = str.maketrans({
-    "C": "K", "Q": "K", "G": "K", "X": "K",
-    "V": "B", "F": "P", "W": "B",
-    "L": "R", "Z": "J", "D": "T", "S": "S",
-})
+# --------------------------------------------------------------------------- #
+# Phonetic class strings
+# --------------------------------------------------------------------------- #
+
+_VOWELS = set("AEIOU")
 
 
-def skeleton(latin: str) -> str:
-    """Consonant skeleton with similar consonants merged; vowels dropped."""
-    s = latin.translate(_SKELETON_MAP)
-    s = s.replace("PH", "P").replace("TH", "T").replace("SH", "S").replace("KH", "K")
-    s = re.sub(r"[AEIOUYH]", "", s)
-    return re.sub(r"(.)\1+", r"\1", s)
+def _english_phones(word: str) -> list[str]:
+    """Map an upper-case Latin word to (class, is_vowel) items."""
+    w = word
+    w = re.sub(r"(?<=[AEIOU])GH", "", w)
+    w = w.replace("TCH", "C").replace("CH", "C").replace("SH", "S").replace("PH", "P")
+    w = w.replace("TH", "T").replace("CK", "K").replace("QU", "K").replace("WH", "W")
+    w = w.replace("DG", "S").replace("X", "KS")
+    w = re.sub(r"^KN", "N", w).replace("WR", "R")
+    w = re.sub(r"NG(?![AEIOUYLR])", "N", w)
+    out: list[str] = []
+    n = len(w)
+    for i, ch in enumerate(w):
+        nxt = w[i + 1] if i + 1 < n else ""
+        if ch.isdigit():
+            out.append(ch)
+        elif ch in "AEIOU":
+            out.append(ch.lower())
+        elif ch == "Y":
+            out.append("i" if (i == n - 1 or nxt not in "AEIOU") else "")
+        elif ch == "W":
+            out.append("" if nxt in "OU" else "")
+        elif ch == "C":
+            out.append("S" if nxt in "EIY" else "K")
+        elif ch == "G":
+            out.append("S" if nxt in "EIY" else "K")
+        elif ch in "JZS":
+            out.append("S")
+        elif ch in "BV":
+            out.append("B")
+        elif ch in "PF":
+            out.append("P")
+        elif ch == "Q":
+            out.append("K")
+        elif ch in "LR":
+            out.append("R")
+        else:
+            out.append(ch)
+    return [p for p in out if p]
+
+
+def _hangul_phones(word: str) -> list[str]:
+    out: list[str] = []
+    for is_syl, i, m, f, ch in _syllables(word):
+        if not is_syl:
+            if ch.isalnum():
+                out.extend(_english_phones(ch.upper()) if ch.isalpha() else [ch])
+            continue
+        ini, vow, fin = _INIT_CLS[i], _MED_VOW[m], _FIN_CLS[f]
+        if ini:
+            out.append(ini)
+        if vow:
+            out.append(vow.lower())
+        if fin:
+            out.append(fin)
+    return out
+
+
+_LETTER_NAMES = {
+    "에이치": "H", "더블유": "W", "에이": "A", "에프": "F", "아이": "I", "제이": "J",
+    "케이": "K", "에스": "S", "브이": "V", "엑스": "X", "와이": "Y", "제트": "Z",
+    "지드": "Z", "비": "B", "씨": "C", "디": "D", "이": "E", "지": "G", "엘": "L",
+    "엠": "M", "엔": "N", "앤": "N", "오": "O", "피": "P", "큐": "Q", "알": "R",
+    "티": "T", "유": "U", "쥐": "G",
+}
+_LETTER_KEYS = sorted(_LETTER_NAMES, key=len, reverse=True)
+
+
+def split_letter_names(token: str) -> tuple[str, str]:
+    """Greedy parse of spelled-out Latin letters at the start of a Hangul token.
+
+    ``케이에스`` -> ("KS", ""), ``엠에스살비아`` -> ("MS", "살비아"),
+    ``에이스`` -> ("", "에이스") (fewer than two letters: not an initialism).
+    """
+    letters = []
+    pos = 0
+    while pos < len(token):
+        for key in _LETTER_KEYS:
+            if token.startswith(key, pos):
+                letters.append(_LETTER_NAMES[key])
+                pos += len(key)
+                break
+        else:
+            break
+    if len(letters) >= 2:
+        return "".join(letters), token[pos:]
+    return "", token
+
+
+def _phones(value: object) -> list[list[str]]:
+    """Per-token phone lists (classes upper-case, vowels lower-case)."""
+    result = []
+    for tok in tokens(value):
+        if is_hangul(tok):
+            letters, rest = split_letter_names(tok)
+            phones = _english_phones(letters) + _hangul_phones(rest) if letters else _hangul_phones(tok)
+        else:
+            phones = _english_phones(tok)
+        result.append(phones)
+    return result
+
+
+def _consonant_string(phones: list[str]) -> str:
+    s = "".join(p for p in phones if not p.islower())
+    # post-vocalic R (not followed by a consonant-class vowel) is dropped in
+    # Korean transliteration (Harbour -> 하버); drop it on both sides.
+    keep = []
+    for i, ch in enumerate(s):
+        if ch == "R" and not _r_before_vowel(phones, i, s):
+            continue
+        keep.append(ch)
+    s = "".join(keep)
+    return re.sub(r"([^0-9])\1+", r"\1", s)
+
+
+def _r_before_vowel(phones: list[str], cons_index: int, cons_string: str) -> bool:
+    """True when the ``cons_index``-th consonant in ``phones`` is followed by a vowel."""
+    count = -1
+    for j, p in enumerate(phones):
+        if not p.islower():
+            count += 1
+            if count == cons_index:
+                nxt = phones[j + 1] if j + 1 < len(phones) else ""
+                return nxt.islower()
+    return False
+
+
+def _vowel_string(phones: list[str]) -> str:
+    s = "".join(p.upper() if p.islower() else p for p in phones)
+    return re.sub(r"([^0-9])\1+", r"\1", s)
+
+
+@lru_cache(maxsize=None)
+def name_reps(value: str) -> tuple[str, str, str, tuple[str, ...], frozenset[str]]:
+    """(latin_key, consonant_string, vowel_string, token_consonant_strings, digits)."""
+    phones = _phones(value)
+    cons_tokens = tuple(_consonant_string(p) for p in phones)
+    cons = "".join(cons_tokens)
+    cons = re.sub(r"([^0-9])\1+", r"\1", cons)
+    vow = "".join(_vowel_string(p) for p in phones)
+    digits = frozenset(re.findall(r"\d+", _clean(value)))
+    return latin_key(value), cons, vow, cons_tokens, digits
+
+
+# --------------------------------------------------------------------------- #
+# Similarity helpers
+# --------------------------------------------------------------------------- #
 
 
 def grams(value: str, width: int) -> frozenset[str]:
-    if len(value) < width:
-        return frozenset((value,)) if value else frozenset()
-    return frozenset(value[i: i + width] for i in range(len(value) - width + 1))
+    if not value:
+        return frozenset()
+    padded = f"^{value}$"
+    if len(padded) < width:
+        return frozenset((padded,))
+    return frozenset(padded[i: i + width] for i in range(len(padded) - width + 1))
 
 
 def jaccard(left: frozenset[str], right: frozenset[str]) -> float:
     if not left or not right:
         return 0.0
     return len(left & right) / len(left | right)
+
+
+@lru_cache(maxsize=2_000_000)
+def lev_sim(a: str, b: str) -> float:
+    """1 - normalised Levenshtein distance."""
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return 1.0 - prev[-1] / len(a)
 
 
 def positive_float(value: object) -> float | None:
@@ -138,16 +309,16 @@ def relative_gap(left: float | None, right: float | None) -> float:
     return min(abs(left - right) / max(left, right, 1.0), 2.0)
 
 
-def tokens(value: object) -> list[str]:
-    if not isinstance(value, str):
-        return []
-    value = unicodedata.normalize("NFKC", value).upper()
-    return [t for t in re.split(r"[^0-9A-Z가-힣]+", value) if t]
-
-
 # --------------------------------------------------------------------------- #
 # Hard-coded answers memorised from train.csv
 # --------------------------------------------------------------------------- #
+
+
+def normalize_name(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = unicodedata.normalize("NFKC", value).upper()
+    return "".join(ch for ch in value if ch.isalnum())
 
 
 class AnswerBook:
@@ -156,7 +327,6 @@ class AnswerBook:
     def __init__(self, train: pd.DataFrame) -> None:
         self.by_call_sign: dict[str, str] = {}
         self.by_name: dict[str, str] = {}
-        self.by_name_tonnage: dict[tuple[str, float], str] = {}
         conflicts = 0
         for row in train.to_dict("records"):
             target = str(row["target_vessel_id"])
@@ -168,9 +338,6 @@ class AnswerBook:
             if name:
                 prev = self.by_name.setdefault(name, target)
                 conflicts += int(prev != target)
-                gt = positive_float(row.get("gross_tonnage"))
-                if gt is not None:
-                    self.by_name_tonnage.setdefault((name, gt), target)
         self.conflicts = conflicts
 
     def lookup(self, row: dict) -> str | None:
@@ -182,13 +349,36 @@ class AnswerBook:
             return self.by_name[name]
         return None
 
-    def __len__(self) -> int:
-        return len(self.by_call_sign) + len(self.by_name)
-
 
 # --------------------------------------------------------------------------- #
-# Catalog index and pairwise features
+# Catalog index (numpy posting lists, bincount scoring)
 # --------------------------------------------------------------------------- #
+
+
+class _GramIndex:
+    def __init__(self, strings: list[str], width: int) -> None:
+        self.width = width
+        self.sets = [grams(s, width) for s in strings]
+        self.sizes = np.asarray([len(s) for s in self.sets], dtype=np.float32)
+        postings: dict[str, list[int]] = defaultdict(list)
+        for i, gs in enumerate(self.sets):
+            for g in gs:
+                postings[g].append(i)
+        self.postings = {g: np.asarray(ix, dtype=np.int32) for g, ix in postings.items()}
+        self.n = len(strings)
+
+    def counts(self, query: str) -> tuple[np.ndarray, int]:
+        qg = grams(query, self.width)
+        arrays = [self.postings[g] for g in qg if g in self.postings]
+        if not arrays:
+            return np.zeros(self.n, dtype=np.int32), len(qg)
+        return np.bincount(np.concatenate(arrays), minlength=self.n), len(qg)
+
+    def scores(self, query: str) -> np.ndarray:
+        counts, qn = self.counts(query)
+        if qn == 0:
+            return np.zeros(self.n, dtype=np.float32)
+        return counts / (qn + self.sizes - counts)
 
 
 class CatalogIndex:
@@ -201,29 +391,32 @@ class CatalogIndex:
         self.catalog = catalog.reset_index(drop=True)
         if not self.catalog["vessel_id"].is_unique:
             raise ValueError("vessel_id must be unique in the catalog")
-
         self.ids = self.catalog["vessel_id"].astype(str).tolist()
         self.id_to_index = {vid: i for i, vid in enumerate(self.ids)}
-        self.names = [latin_key(v) for v in self.catalog["vessel_name"]]
-        self.skeletons = [skeleton(n) for n in self.names]
-        self.bigrams = [grams(n, 2) for n in self.names]
-        self.trigrams = [grams(n, 3) for n in self.names]
-        self.skel_bigrams = [grams(s, 2) for s in self.skeletons]
-        self.token_sets = [frozenset(tokens(v)) for v in self.catalog["vessel_name"]]
-        self.flags = self.catalog.get("flag_name", pd.Series([""] * len(self.catalog))).astype(str).tolist()
-        self.types = self.catalog.get("vessel_type", pd.Series([""] * len(self.catalog))).astype(str).tolist()
+        raw_names = ["" if not isinstance(v, str) else v for v in self.catalog["vessel_name"]]
+        reps = [name_reps(v) for v in raw_names]
+        self.latin = [r[0] for r in reps]
+        self.cons = [r[1] for r in reps]
+        self.vow = [r[2] for r in reps]
+        self.cons_tokens = [r[3] for r in reps]
+        self.digits = [r[4] for r in reps]
+        self.token_sets = [frozenset(tokens(v)) for v in raw_names]
+        self.flags = self.catalog["flag_name"].astype(str).tolist() if "flag_name" in self.catalog else [""] * len(self.ids)
+        self.types = self.catalog["vessel_type"].astype(str).tolist() if "vessel_type" in self.catalog else [""] * len(self.ids)
         self.gt = pd.to_numeric(self.catalog["gross_tonnage"], errors="coerce").to_numpy(dtype=float)
 
-        self.exact_name: dict[str, list[int]] = defaultdict(list)
-        self.trigram_postings: dict[str, list[int]] = defaultdict(list)
-        self.skel_postings: dict[str, list[int]] = defaultdict(list)
-        for i, name in enumerate(self.names):
-            if name:
-                self.exact_name[name].append(i)
-            for g in self.trigrams[i]:
-                self.trigram_postings[g].append(i)
-            for g in self.skel_bigrams[i]:
-                self.skel_postings[g].append(i)
+        self.latin_bi = _GramIndex(self.latin, 2)
+        self.latin_tri = _GramIndex(self.latin, 3)
+        self.cons_bi = _GramIndex(self.cons, 2)
+        self.cons_tri = _GramIndex(self.cons, 3)
+        self.vow_bi = _GramIndex(self.vow, 2)
+        self.exact_latin: dict[str, list[int]] = defaultdict(list)
+        self.exact_cons: dict[str, list[int]] = defaultdict(list)
+        for i, (l, c) in enumerate(zip(self.latin, self.cons)):
+            if l:
+                self.exact_latin[l].append(i)
+            if c:
+                self.exact_cons[c].append(i)
 
         valid = np.flatnonzero(np.isfinite(self.gt) & (self.gt > 0))
         order = np.argsort(self.gt[valid], kind="mergesort")
@@ -234,28 +427,37 @@ class CatalogIndex:
         if value is None or len(self.sorted_gt_values) == 0:
             return []
         pos = int(np.searchsorted(self.sorted_gt_values, value))
-        left, right = pos - 1, pos
-        found: list[int] = []
-        n = len(self.sorted_gt_values)
-        while len(found) < count and (left >= 0 or right < n):
-            if right >= n:
-                take_left = True
-            elif left < 0:
-                take_left = False
-            else:
-                take_left = abs(self.sorted_gt_values[left] - value) <= abs(self.sorted_gt_values[right] - value)
-            found.append(int(self.sorted_gt_indices[left if take_left else right]))
-            left -= int(take_left)
-            right += int(not take_left)
-        return found
+        lo, hi = max(0, pos - count), min(len(self.sorted_gt_values), pos + count)
+        idx = self.sorted_gt_indices[lo:hi]
+        order = np.argsort(np.abs(self.gt[idx] - value), kind="mergesort")[:count]
+        return [int(i) for i in idx[order]]
 
     def gt_window(self, value: float | None, tolerance: float) -> np.ndarray:
-        """Catalog rows whose gross tonnage lies within ``tolerance`` (relative)."""
         if value is None or len(self.sorted_gt_values) == 0:
             return np.empty(0, dtype=int)
         lo = np.searchsorted(self.sorted_gt_values, value * (1 - tolerance), side="left")
         hi = np.searchsorted(self.sorted_gt_values, value * (1 + tolerance), side="right")
         return self.sorted_gt_indices[lo:hi]
+
+
+# --------------------------------------------------------------------------- #
+# Ranker
+# --------------------------------------------------------------------------- #
+
+
+def _topk(scores: np.ndarray, k: int, subset: np.ndarray | None = None) -> list[int]:
+    if subset is not None:
+        if len(subset) == 0:
+            return []
+        local = scores[subset]
+        k = min(k, len(local))
+        part = np.argpartition(-local, k - 1)[:k]
+        part = part[np.argsort(-local[part], kind="mergesort")]
+        return [int(subset[i]) for i in part if local[i] > 0]
+    k = min(k, len(scores))
+    part = np.argpartition(-scores, k - 1)[:k]
+    part = part[np.argsort(-scores[part], kind="mergesort")]
+    return [int(i) for i in part if scores[i] > 0]
 
 
 class Ranker:
@@ -266,7 +468,6 @@ class Ranker:
                              suffixes=("_q", "_c"))
         self.flag_prob = self._conditional(merged, "flag_name_q", "flag_name_c")
         self.type_prob = self._conditional(merged, "vessel_type_q", "vessel_type_c")
-        self.token_map = self._token_dictionary(merged)
 
     @staticmethod
     def _conditional(merged: pd.DataFrame, q: str, c: str) -> dict[str, dict[str, float]]:
@@ -277,91 +478,65 @@ class Ranker:
             table[str(key)] = (counts / counts.sum()).to_dict()
         return table
 
-    @staticmethod
-    def _token_dictionary(merged: pd.DataFrame) -> dict[str, str]:
-        """Hangul token -> Latin token learned from aligned train/catalog names."""
-        pair_counts: Counter[tuple[str, str]] = Counter()
-        for q, c in zip(merged["vessel_name_q"], merged["vessel_name_c"]):
-            if not is_hangul(q):
-                continue
-            qt, ct = tokens(q), tokens(c)
-            if len(qt) == len(ct):
-                for a, b in zip(qt, ct):
-                    if is_hangul(a):
-                        pair_counts[(a, b)] += 1
-            elif len(qt) == 1 and ct:
-                pair_counts[(qt[0], "".join(ct))] += 1
-        best: dict[str, tuple[str, int]] = {}
-        for (a, b), n in pair_counts.items():
-            if a not in best or n > best[a][1]:
-                best[a] = (b, n)
-        return {a: b for a, (b, _) in best.items()}
+    # ---- retrieval ------------------------------------------------------- #
 
-    # ---- query side ----------------------------------------------------- #
-
-    def query_key(self, name: object) -> str:
-        """Latin key for a query name, using the learned token dictionary first."""
-        if not is_hangul(name):
-            return latin_key(name)
-        parts = []
-        for tok in tokens(name):
-            parts.append(self.token_map.get(tok, tok))
-        return latin_key(" ".join(parts))
-
-    def candidates(self, row: dict, index: CatalogIndex, name_limit: int = 20,
-                   tonnage_limit: int = 12, max_candidates: int = 48) -> list[tuple[int, int]]:
-        """Return (catalog_index, source_bits) for one query row."""
-        qkey = self.query_key(row.get("vessel_name"))
+    def candidates(self, row: dict, index: CatalogIndex, k_name: int = 20,
+                   k_window: int = 25, k_near: int = 10, tolerance: float = 0.06,
+                   max_candidates: int = 90) -> list[tuple[int, int]]:
+        """Return (catalog_index, source_bits): 1 = name, 2 = tonnage, 4 = exact."""
+        name = row.get("vessel_name")
+        latin, cons, vow, _, _ = name_reps(name if isinstance(name, str) else "")
         gross = positive_float(row.get("gross_tonnage"))
         intl = positive_float(row.get("international_gross_tonnage"))
-        hangul = is_hangul(row.get("vessel_name"))
         output: dict[int, int] = {}
 
         def add(indices, bit):
             for i in indices:
-                if len(output) >= max_candidates and i not in output:
-                    continue
-                output[i] = output.get(i, 0) | bit
+                if i in output:
+                    output[i] |= bit
+                elif len(output) < max_candidates:
+                    output[i] = bit
 
-        if qkey:
-            add(index.exact_name.get(qkey, [])[:name_limit], 1)
-            counts: Counter[int] = Counter()
-            for g in grams(qkey, 3):
-                counts.update(index.trigram_postings.get(g, ()))
-            add(nlargest(name_limit, counts, key=lambda i: (counts[i], -i)), 1)
-            if hangul:
-                sk = skeleton(qkey)
-                counts = Counter()
-                for g in grams(sk, 2):
-                    counts.update(index.skel_postings.get(g, ()))
-                add(nlargest(name_limit, counts, key=lambda i: (counts[i], -i)), 1)
-
-        for value in {gross, intl} - {None}:
-            add(index.nearest_gt(value, tonnage_limit), 2)
-            if hangul:
-                # Within a tonnage window pick the best name matches.
-                window = index.gt_window(value, 0.08)
-                if len(window):
-                    qb = grams(qkey, 2)
-                    scored = nlargest(name_limit, window,
-                                      key=lambda i: jaccard(qb, index.bigrams[i]))
-                    add(scored, 2)
+        if latin:
+            add(index.exact_latin.get(latin, [])[:k_name], 4 | 1)
+        if cons:
+            add(index.exact_cons.get(cons, [])[:k_name], 4 | 1)
+        name_scores = None
+        if latin or cons:
+            parts = []
+            if latin:
+                parts.append(index.latin_bi.scores(latin))
+                parts.append(index.latin_tri.scores(latin))
+            if cons:
+                parts.append(index.cons_bi.scores(cons))
+                parts.append(index.cons_tri.scores(cons))
+            if vow:
+                parts.append(index.vow_bi.scores(vow))
+            for p in parts:
+                add(_topk(p, k_name), 1)
+            name_scores = np.maximum.reduce(parts)
+        for value in sorted({gross, intl} - {None}):
+            add(index.nearest_gt(value, k_near), 2)
+            window = index.gt_window(value, tolerance)
+            if len(window) and name_scores is not None:
+                add(_topk(name_scores, k_window, window), 2)
         if not output:
             output[0] = 0
         return list(output.items())
 
+    # ---- features -------------------------------------------------------- #
+
     def features(self, row: dict, index: CatalogIndex, cand: int, bits: int) -> list[float]:
-        qkey = self.query_key(row.get("vessel_name"))
-        ckey = index.names[cand]
-        qsk = skeleton(qkey)
-        csk = index.skeletons[cand]
+        name = row.get("vessel_name")
+        qlatin, qcons, qvow, qtoks, qdigits = name_reps(name if isinstance(name, str) else "")
+        clatin, ccons, cvow = index.latin[cand], index.cons[cand], index.vow[cand]
+        ctoks, cdigits = index.cons_tokens[cand], index.digits[cand]
         gross = positive_float(row.get("gross_tonnage"))
         intl = positive_float(row.get("international_gross_tonnage"))
         cgt = positive_float(index.gt[cand])
-        g_gap = relative_gap(gross, cgt)
-        i_gap = relative_gap(intl, cgt)
+        g_gap, i_gap = relative_gap(gross, cgt), relative_gap(intl, cgt)
         prefix = 0
-        for a, b in zip(qkey, ckey):
+        for a, b in zip(qlatin, clatin):
             if a != b:
                 break
             prefix += 1
@@ -370,28 +545,51 @@ class Ranker:
         flag_prob = 0.0 if flag_missing else self.flag_prob.get(qflag, {}).get(index.flags[cand], 0.0)
         qtype = row.get("vessel_type")
         type_prob = self.type_prob.get(qtype, {}).get(index.types[cand], 0.0) if isinstance(qtype, str) else 0.0
-        qtok = frozenset(self.token_map.get(t, t) for t in tokens(row.get("vessel_name")))
-        ctok = index.token_sets[cand]
+        if qtoks and ctoks:
+            best = [max(lev_sim(a, b) for b in ctoks) for a in qtoks if a]
+            tok_mean = float(np.mean(best)) if best else 0.0
+            tok_min = float(min(best)) if best else 0.0
+        else:
+            tok_mean = tok_min = 0.0
+        qtok_set = frozenset(tokens(name))
+        if qdigits or cdigits:
+            digits_match = float(qdigits == cdigits)
+        else:
+            digits_match = 0.5
         return [
-            float(bool(qkey) and qkey == ckey),
-            jaccard(grams(qkey, 2), index.bigrams[cand]),
-            jaccard(grams(qkey, 3), index.trigrams[cand]),
-            prefix / max(len(qkey), len(ckey), 1),
-            min(len(qkey), len(ckey)) / max(len(qkey), len(ckey), 1),
-            float(bool(qsk) and qsk == csk),
-            jaccard(grams(qsk, 2), index.skel_bigrams[cand]),
-            jaccard(qtok, ctok),
+            float(bool(qlatin) and qlatin == clatin),
+            lev_sim(qlatin, clatin),
+            jaccard(grams(qlatin, 2), index.latin_bi.sets[cand]),
+            jaccard(grams(qlatin, 3), index.latin_tri.sets[cand]),
+            prefix / max(len(qlatin), len(clatin), 1),
+            min(len(qlatin), len(clatin)) / max(len(qlatin), len(clatin), 1),
+            float(bool(qcons) and qcons == ccons),
+            lev_sim(qcons, ccons),
+            jaccard(grams(qcons, 2), index.cons_bi.sets[cand]),
+            jaccard(grams(qcons, 3), index.cons_tri.sets[cand]),
+            min(len(qcons), len(ccons)) / max(len(qcons), len(ccons), 1),
+            float(bool(qvow) and qvow == cvow),
+            lev_sim(qvow, cvow),
+            jaccard(grams(qvow, 2), index.vow_bi.sets[cand]),
+            tok_mean,
+            tok_min,
+            float(abs(len(qtoks) - len(ctoks))),
+            jaccard(qtok_set, index.token_sets[cand]),
+            digits_match,
+            float(bool(qdigits)),
             g_gap,
             i_gap,
             min(g_gap, i_gap),
+            float(g_gap == 0.0 or i_gap == 0.0),
             float(gross is None and intl is None),
             float(cgt is None),
             flag_prob,
             float(flag_missing),
             type_prob,
-            float(is_hangul(row.get("vessel_name"))),
+            float(is_hangul(name)),
             float(bits & 1 > 0),
             float(bits & 2 > 0),
+            float(bits & 4 > 0),
         ]
 
 
@@ -401,7 +599,7 @@ class Ranker:
 
 
 def make_training_pairs(train: pd.DataFrame, ranker: Ranker, index: CatalogIndex,
-                        max_negatives: int = 24) -> tuple[np.ndarray, np.ndarray, float]:
+                        max_negatives: int = 40) -> tuple[np.ndarray, np.ndarray, float]:
     feats: list[list[float]] = []
     labels: list[int] = []
     retrieved = 0
@@ -418,14 +616,13 @@ def make_training_pairs(train: pd.DataFrame, ranker: Ranker, index: CatalogIndex
             retrieved / max(len(train), 1))
 
 
-def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 200,
-        random_state: int = 42) -> dict:
-    """Build the full bundle: hard-coded answer book + fallback ranker."""
+def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
+        random_state: int = 42, index: CatalogIndex | None = None) -> dict:
     from sklearn.ensemble import RandomForestClassifier
 
     if "target_vessel_id" not in train.columns:
         raise ValueError("Training data needs target_vessel_id")
-    index = CatalogIndex(catalog)
+    index = index or CatalogIndex(catalog)
     unknown = set(train["target_vessel_id"].astype(str)) - set(index.id_to_index)
     if unknown:
         raise ValueError(f"Training targets missing from catalog: {sorted(unknown)[:5]}")
@@ -433,7 +630,7 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 200,
     ranker = Ranker(train, catalog)
     X, y, recall = make_training_pairs(train, ranker, index)
     model = RandomForestClassifier(
-        n_estimators=n_estimators, max_depth=16, min_samples_leaf=3,
+        n_estimators=n_estimators, max_depth=None, min_samples_leaf=2, max_features="sqrt",
         class_weight="balanced_subsample", n_jobs=-1, random_state=random_state,
     )
     model.fit(X, y)
@@ -450,8 +647,7 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 200,
 
 def predict_ids(bundle: dict, queries: pd.DataFrame, index: CatalogIndex,
                 use_answers: bool = True, batch_size: int = 256) -> tuple[list[str], list[str]]:
-    """Predict one catalog ID per row. Returns (ids, source) with source in
-    {"answer_book", "ranker"}."""
+    """Predict one catalog ID per row. Returns (ids, sources)."""
     if tuple(bundle["feature_names"]) != FEATURE_NAMES:
         raise ValueError("Model and feature code versions do not match")
     answers: AnswerBook = bundle["answers"]
