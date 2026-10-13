@@ -805,7 +805,7 @@ _NONAME_IDX = np.asarray([FEATURE_NAMES.index(f) for f in NONAME_FEATURES])
 
 
 def _fit_models(rows, n_estimators: int = 300, random_state: int = 42,
-                use_rf: bool = False, max_negatives: int = 40) -> dict:
+                use_rf: bool = False, max_negatives: int = 40, noname: bool = False) -> dict:
     """Train the scorers on cached per-row candidate matrices."""
     from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 
@@ -819,7 +819,8 @@ def _fit_models(rows, n_estimators: int = 300, random_state: int = 42,
         )
 
     models = {"hgb": booster(random_state).fit(X_all, y_all)}
-    models["noname"] = booster(random_state + 1).fit(X_all[:, _NONAME_IDX], y_all)
+    if noname:   # name-free fallback: hurt held-out accuracy, kept opt-in for experiments
+        models["noname"] = booster(random_state + 1).fit(X_all[:, _NONAME_IDX], y_all)
     if use_rf:
         X_h, y_h = _select(rows, max_negatives, scorer=lambda M: models["hgb"].predict_proba(M)[:, 1])
         models["rf"] = RandomForestClassifier(
@@ -829,7 +830,7 @@ def _fit_models(rows, n_estimators: int = 300, random_state: int = 42,
     return models
 
 
-def _score(models, X: np.ndarray, fallback_threshold: float = 0.02) -> np.ndarray:
+def _score(models, X: np.ndarray, fallback_threshold: float = 0.0) -> np.ndarray:
     """Raw ranking scores for the candidates of ONE query row.
 
     The main booster's decision function is used (no probability saturation).
@@ -843,7 +844,7 @@ def _score(models, X: np.ndarray, fallback_threshold: float = 0.02) -> np.ndarra
     if "rf" in models:
         rf_p = np.clip(models["rf"].predict_proba(X)[:, 1], 1e-6, 1 - 1e-6)
         score = 0.5 * score + 0.5 * np.log(rf_p / (1 - rf_p))
-    if "noname" in models:
+    if "noname" in models and fallback_threshold > 0:
         best_p = 1.0 / (1.0 + np.exp(-score.max()))
         if best_p < fallback_threshold:
             score = models["noname"].decision_function(X[:, _NONAME_IDX])
@@ -852,7 +853,8 @@ def _score(models, X: np.ndarray, fallback_threshold: float = 0.02) -> np.ndarra
 
 def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         random_state: int = 42, index: CatalogIndex | None = None,
-        use_rf: bool = False, n_jobs: int | None = None, **_ignored) -> dict:
+        use_rf: bool = False, noname: bool = False, n_jobs: int | None = None,
+        **_ignored) -> dict:
     if "target_vessel_id" not in train.columns:
         raise ValueError("Training data needs target_vessel_id")
     index = index or CatalogIndex(catalog)
@@ -862,7 +864,8 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
     answers = AnswerBook(train)
     ranker = Ranker(train, catalog)
     rows, recall = _row_matrices(train, ranker, index, n_jobs=n_jobs)
-    models = _fit_models(rows, n_estimators=n_estimators, random_state=random_state, use_rf=use_rf)
+    models = _fit_models(rows, n_estimators=n_estimators, random_state=random_state,
+                         use_rf=use_rf, noname=noname)
     return {
         "version": VERSION,
         "feature_names": FEATURE_NAMES,
