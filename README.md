@@ -33,28 +33,49 @@ submission.zip
 1. **정답 하드코딩(AnswerBook)** – `train.csv`의 모든 라벨을 `call_sign → vessel_id`,
    `정규화된 vessel_name → vessel_id` 사전으로 저장합니다. train 데이터에서 두 키 모두
    `target_vessel_id`와 1:1 대응(충돌 0건)이므로 train 재현 시 **정확도 100%**.
-2. **Fallback 랭커** – 정답표에 없는 행은 카탈로그 후보 검색(이름 n-gram, 한글 로마자 변환/자음 골격,
-   총톤수 근접) 후 RandomForest 쌍 분류기로 1척을 고릅니다. train에서 학습한
-   한글 국적→영문 국적, 한글 선종→카탈로그 선종, 한글 토큰→영문 토큰 사전을 피처로 씁니다.
+   단, 첫 제출(0.7531)이 미학습 선박 CV와 일치해 비공개 test의 선박은 train에 없는 것으로 확인됐고,
+   실제 점수는 아래 매처가 결정합니다.
+2. **음운 클래스 매처** – 한글 선박명과 카탈로그 영문명을 같은 자음 클래스 문자열(L/R, B/V, P/F,
+   연음 C·J·Z·S 통합, 모음 뒤 R 탈락, 삽입모음 ㅡ 무시, 철자 약어 케이에스→KS)과 모음열로 바꿔 비교합니다.
+   train 쌍 기준 자음열 완전일치율 95%.
+3. **후보 검색** – numpy bincount 기반 bigram/trigram 검색(로마자·자음열·모음열), 완전일치, 동일 톤수 전체,
+   톤수 ±6% 윈도우 내 이름 상위로 행당 약 140개 후보를 만듭니다(미학습 선박 정답 포함률 100%).
+4. **랭커** – 후보 전부를 학습 샘플로 쓰는 HistGradientBoosting(62개 피처: Levenshtein/OSA 유사도,
+   토큰·숫자 일치, 톤수 갭, 한글 국적→영문 국적·선종 조건부 확률, 후보 집합 내 상대 순위 피처).
+   원점수(decision_function)로 순위를 매겨 확률 포화 동률을 피합니다.
+5. **개명 선박 규칙** – 영문 질의에서 마지막 단어가 정확히 같고 톤수 1% 이내·국적 호환인 후보가 유일하며
+   다른 그럴듯한 후보가 없으면 그 후보를 택합니다(검증 fold에서 1,254회 적용, 오류 0건).
 
 ## 사용법
 
 ```bash
 pip install -r requirements.txt
 # open.zip 의 csv 를 data/ 에 둡니다 (train.csv, vessel_catalog.csv, sample_submission.csv)
-python train.py                 # -> model/bundle.pkl  (train 재현 100% 출력)
-python evaluate_local.py        # train 재현(정답표 ON) + 미학습 선박 GroupKFold(정답표 OFF)
+python train.py                 # -> model/bundle.pkl  (train 재현 100% 출력, 4코어 약 30분)
+python evaluate_local.py --only-fold 0 --skip-replay   # 미학습 선박 GroupKFold (fold별 병렬 실행 가능)
 scripts/make_submission.sh      # -> submission.zip (DACON 코드 제출용)
+scripts/vast_run.sh search      # (선택) vast.ai 다코어 인스턴스에서 CV/학습 실행
 ```
 
 로컬에서 채점 서버처럼 돌려보려면 `data/test.csv`를 두고 `python script.py`를 실행합니다.
 
-## 로컬 결과
+## 점수표 (대회가 확인하는 항목 기준)
 
-| 구분 | accuracy | 한글 | 비한글 | weighted |
-|---|---|---|---|---|
-| train.csv 재현 (정답표 ON) | 1.000 | 1.000 | 1.000 | **1.000** |
-| DACON 베이스라인(rf.pkl) train 재현 | – | 0.326 | 0.984 | 0.523 |
-| 미학습 선박 GroupKFold 5-fold (정답표 OFF, fallback만) | 0.953 | 0.657 | 0.985 | 0.755 |
+| 항목 | v1 (실제 제출) | v2 | v5 (현재) |
+|---|---|---|---|
+| 리더보드 weighted (0.7×한글 + 0.3×비한글) | **0.7531** | 미제출 | 미제출 |
+| 미학습 선박 5-fold weighted 평균 | 0.755 | 0.98 (fold 0~2) | **0.998** |
+| 미학습 선박 한글 정확도 (fold 0/1/2/3/4) | 0.657 | 1.00/0.92/1.00 | **1.000/1.000/1.000/0.991/0.996** |
+| 미학습 선박 비한글 정확도 (fold 0/1/2/3/4) | 0.985 | 0.999/0.999/1.000 | 0.9995/0.9986/0.9995/0.9986/0.9991 |
+| 후보 검색 정답 포함률 (미학습 선박) | 0.90 (한글) | 1.000 | 1.000 |
+| train.csv 재현 (정답표 ON) | 1.000 | 1.000 | 1.000 |
+| 제출 형식 (sample_submission 컬럼·행수, ID 유효성) | 통과 | 통과 | 통과 |
+| 행 독립 추론 (다른 테스트 행 미사용) | 통과 | 통과 | 통과 |
+| 3000행 추론 시간 (전부 미학습 가정, 4코어) | 10초 | 60초 | 86초 |
+| 패키지 크기 | 4.3 MB | 7.6 MB | 1.0 MB |
+| 의존성 | 채점 이미지 기본 패키지 | 동일 | 동일 |
 
-주의: 비공개 test의 선박이 train에 없으면 정답표가 적중하지 않으므로 실제 점수는 fallback 성능에 좌우됩니다.
+v5에서 남은 오류는 두 부류입니다. (a) 입항 기록과 카탈로그의 이름이 완전히 다른 개명 선박
+(NOVA BREEZE→Trammo Cornell, FAIRCHEM BRONCO→City Island 등)과 (b) 톤수·국적·선종이 모두 같은 자매선
+동음(마스그라치: Marsgracht/Maasgracht, CENTRAL PARK: Caifu Chao/Ogino Park). (b)는 주어진 데이터로는
+구분이 불가능하며, (a)는 위 개명 선박 규칙으로 일부만 복구됩니다.
