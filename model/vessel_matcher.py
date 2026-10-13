@@ -924,9 +924,14 @@ def predict_ids(bundle: dict, queries: pd.DataFrame, index: CatalogIndex,
     for start in range(0, len(pending), batch_size):
         chunk = pending[start: start + batch_size]
         results = _parallel_map(_query_row, [records[p] for p in chunk], ranker, index, n_jobs)
+        # one batched model call for the whole chunk (per-row calls are ~50x slower)
+        scores = _score(models, np.vstack([X for X, _ in results]))
+        offset = 0
         for pos, (X, cand_idx) in zip(chunk, results):
+            local = scores[offset: offset + len(cand_idx)]
+            offset += len(cand_idx)
             forced = _rename_override(X)
-            best = forced if forced is not None else int(np.argmax(_score(models, X)))
+            best = forced if forced is not None else int(np.argmax(local))
             ids[pos] = index.ids[cand_idx[best]]
     return ids, sources  # type: ignore[return-value]
 
