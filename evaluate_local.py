@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--n-estimators", type=int, default=120)
     parser.add_argument("--skip-cv", action="store_true")
     parser.add_argument("--skip-replay", action="store_true")
+    parser.add_argument("--only-fold", type=int, default=None, help="run only this fold index")
     args = parser.parse_args()
 
     train = pd.read_csv(args.train, encoding="utf-8-sig")
@@ -52,6 +53,8 @@ def main() -> None:
     gkf = GroupKFold(n_splits=args.folds)
     results = []
     for k, (tr_idx, va_idx) in enumerate(gkf.split(train, groups=train["target_vessel_id"])):
+        if args.only_fold is not None and k != args.only_fold:
+            continue
         started = time.time()
         fold_bundle = fit(train.iloc[tr_idx], catalog, n_estimators=args.n_estimators, index=index)
         va = train.iloc[va_idx]
@@ -65,8 +68,9 @@ def main() -> None:
         metrics["candidate_recall_train"] = fold_bundle["candidate_recall"]
         results.append(metrics)
         print(f"[cv fold {k}] {metrics} ({time.time() - started:.0f}s)")
-    mean = {k: float(np.mean([r[k] for r in results])) for k in results[0]}
-    print("[cv mean] unseen-vessel fallback:", mean)
+    if len(results) > 1:
+        mean = {k: float(np.mean([r[k] for r in results])) for k in results[0]}
+        print("[cv mean] unseen-vessel fallback:", mean)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
-VERSION = "hardcoded-lookup+phonetic-rf-v3"
+VERSION = "hardcoded-lookup+phonetic-ensemble-v4"
 
 FEATURE_NAMES = (
     "latin_exact", "latin_lev", "latin_osa", "latin_bigram_jacc", "latin_trigram_jacc",
@@ -38,7 +38,42 @@ FEATURE_NAMES = (
     "gross_gap", "intl_gap", "best_gap", "gt_exact", "query_gt_missing", "cat_gt_missing",
     "flag_prob", "flag_missing", "type_prob",
     "query_is_hangul", "src_name", "src_tonnage", "src_exact",
+    # listwise (relative to the other candidates of the same query row)
+    "n_candidates",
+    "best_gap_minus_min", "is_min_gap",
+    "cons_lev_minus_max", "is_max_cons_lev",
+    "latin_osa_minus_max", "is_max_latin_osa",
+    "vow_lev_minus_max", "is_max_vow_lev",
+    "flag_prob_minus_max", "is_max_flag_prob",
+    "type_prob_minus_max", "is_max_type_prob",
+    "latin_token_exact_minus_max", "is_max_latin_token_exact",
+    "token_lev_max_minus_max", "is_max_token_lev_max",
+    "digits_match_minus_max",
+    "name_score_minus_max", "is_max_name_score",
 )
+_BASE_FEATURES = FEATURE_NAMES[:FEATURE_NAMES.index("n_candidates")]
+_LISTWISE = (("best_gap", "min"), ("cons_lev", "max"), ("latin_osa", "max"), ("vow_lev", "max"),
+             ("flag_prob", "max"), ("type_prob", "max"), ("latin_token_exact", "max"),
+             ("token_lev_max", "max"), ("digits_match", "max"))
+
+
+def pair_matrix(ranker: "Ranker", row: dict, index: "CatalogIndex",
+                cands: list[tuple[int, int]]) -> np.ndarray:
+    """Base pairwise features for every candidate plus listwise context features."""
+    base = np.asarray([ranker.features(row, index, i, b) for i, b in cands], dtype=np.float32)
+    n = len(cands)
+    cols = {name: base[:, j] for j, name in enumerate(_BASE_FEATURES)}
+    extra = [np.full(n, float(n), dtype=np.float32)]
+    for name, how in _LISTWISE:
+        col = cols[name]
+        best = col.min() if how == "min" else col.max()
+        extra.append(col - best)
+        if name != "digits_match":
+            extra.append((col == best).astype(np.float32))
+    name_score = np.maximum.reduce([cols["cons_lev"], cols["latin_osa"], cols["token_lev_max"]])
+    extra.append(name_score - name_score.max())
+    extra.append((name_score == name_score.max()).astype(np.float32))
+    return np.column_stack([base] + extra).astype(np.float32)
 
 # --------------------------------------------------------------------------- #
 # Hangul decomposition
@@ -47,7 +82,7 @@ FEATURE_NAMES = (
 # Phonetic classes of Hangul jamo (initial, medial, final)
 _INIT_CLS = ["K", "K", "N", "D", "D", "R", "M", "B", "B", "S", "S", "",
              "S", "S", "C", "K", "T", "P", "H"]
-_MED_VOW = ["A", "E", "A", "E", "O", "E", "O", "E", "O", "A", "E",
+_MED_VOW = ["A", "A", "A", "A", "U", "E", "U", "E", "O", "A", "A",
             "E", "O", "U", "O", "E", "I", "U", "", "I", "I"]
 _FIN_CLS = ["", "K", "K", "K", "N", "N", "N", "T", "R", "K", "M", "P", "R",
             "R", "P", "R", "M", "P", "P", "T", "T", "N", "T", "T", "K", "T",
@@ -83,6 +118,11 @@ def romanize(text: str) -> str:
     return "".join(out)
 
 
+_ROMAN = {"II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10,
+          "XI": 11, "XII": 12, "XIII": 13, "XIV": 14, "XV": 15, "XVI": 16, "XVII": 17,
+          "XVIII": 18, "XIX": 19, "XX": 20}
+
+
 def _clean(value: object) -> str:
     if not isinstance(value, str):
         return ""
@@ -92,7 +132,8 @@ def _clean(value: object) -> str:
     if len(re.findall(r"[가-힣]", value)) >= 3:
         value = re.sub(r"호\s*$", "", value)             # trailing 호 (ship suffix)
     # "No. 2 Asian Pioneer" / "Ocean Pioneer No. 2" / 제2 -> move the hull number to the end
-    value = re.sub(r"\b(II|III|IV)\s*$", lambda m: {"II": "2", "III": "3", "IV": "4"}[m.group(1)], value)
+    value = re.sub(r"\b(X{0,1}(?:IX|IV|V?I{0,3}))\s*$",
+                   lambda m: str(_ROMAN[m.group(1)]) if m.group(1) in _ROMAN else m.group(0), value)
     value = re.sub(r"\b(투|쓰리)\s*$", lambda m: {"투": "2", "쓰리": "3"}[m.group(1)], value)
     numbers = re.findall(r"NO\s*\.?\s*(\d+)", value)
     if numbers:
@@ -245,6 +286,7 @@ def _consonant_string(phones: list[str]) -> str:
 
 def _vowel_string(phones: list[str]) -> str:
     s = "".join(p.upper() if p.islower() else p for p in phones)
+    s = s.replace("EI", "A").replace("AI", "I").replace("OU", "O")
     return re.sub(r"([^0-9])\1+", r"\1", s)
 
 
@@ -637,52 +679,54 @@ class Ranker:
 # --------------------------------------------------------------------------- #
 
 
-def make_training_pairs(train: pd.DataFrame, ranker: Ranker, index: CatalogIndex,
-                        max_negatives: int = 40, hard_model=None, keep_first: int = 15):
-    """Positive pair + negatives for every train row.
-
-    Without ``hard_model`` negatives are the first ``max_negatives`` retrieved
-    candidates. With it, negatives are the hardest ones: the ``keep_first``
-    first-retrieved plus the highest-scoring candidates under ``hard_model``.
-    Returns (X, y, groups, candidate_recall).
-    """
-    feats: list[list[float]] = []
-    labels: list[int] = []
-    groups: list[int] = []
+def _row_matrices(train: pd.DataFrame, ranker: "Ranker", index: "CatalogIndex"):
+    """Per train row: (matrix over candidates, label vector). Also returns candidate recall."""
+    rows = []
     retrieved = 0
-    for gid, row in enumerate(train.to_dict("records")):
+    for row in train.to_dict("records"):
         true_idx = index.id_to_index[str(row["target_vessel_id"])]
         cands = ranker.candidates(row, index)
-        cand_map = dict(cands)
-        retrieved += int(true_idx in cand_map)
-        negatives = [(i, b) for i, b in cands if i != true_idx]
-        if hard_model is not None and len(negatives) > max_negatives:
-            neg_feats = [ranker.features(row, index, i, b) for i, b in negatives]
-            scores = hard_model.predict_proba(np.asarray(neg_feats, dtype=np.float32))[:, 1]
+        if true_idx not in dict(cands):
+            cands = cands + [(true_idx, 0)]
+        else:
+            retrieved += 1
+        X = pair_matrix(ranker, row, index, cands)
+        y = np.asarray([int(i == true_idx) for i, _ in cands], dtype=np.int8)
+        rows.append((X, y))
+    return rows, retrieved / max(len(train), 1)
+
+
+def _select(rows, max_negatives: int, scorer=None, keep_first: int = 15):
+    Xs, ys = [], []
+    for X, y in rows:
+        pos = np.flatnonzero(y == 1)
+        neg = np.flatnonzero(y == 0)
+        if scorer is not None and len(neg) > max_negatives:
+            scores = scorer(X[neg])
             order = np.argsort(-scores, kind="mergesort")
-            chosen = list(range(min(keep_first, len(negatives))))
+            chosen = list(range(min(keep_first, len(neg))))
             for j in order:
                 if len(chosen) >= max_negatives:
                     break
                 if int(j) not in chosen:
                     chosen.append(int(j))
-            pairs = [(true_idx, cand_map.get(true_idx, 0), None)]
-            pairs += [(negatives[j][0], negatives[j][1], neg_feats[j]) for j in chosen]
+            neg = neg[chosen]
         else:
-            pairs = [(true_idx, cand_map.get(true_idx, 0), None)]
-            pairs += [(i, b, None) for i, b in negatives[:max_negatives]]
-        for i, b, f in pairs:
-            feats.append(f if f is not None else ranker.features(row, index, i, b))
-            labels.append(int(i == true_idx))
-            groups.append(gid)
-    return (np.asarray(feats, dtype=np.float32), np.asarray(labels, dtype=np.int8),
-            np.asarray(groups, dtype=np.int32), retrieved / max(len(train), 1))
+            neg = neg[:max_negatives]
+        keep = np.concatenate([pos, neg])
+        Xs.append(X[keep])
+        ys.append(y[keep])
+    return np.vstack(Xs), np.concatenate(ys)
+
+
+def _score(models, X: np.ndarray) -> np.ndarray:
+    return np.mean([m.predict_proba(X)[:, 1] for m in models], axis=0)
 
 
 def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         random_state: int = 42, index: CatalogIndex | None = None,
-        hard_negatives: bool = True) -> dict:
-    from sklearn.ensemble import RandomForestClassifier
+        hard_negatives: bool = True, max_negatives: int = 40) -> dict:
+    from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 
     if "target_vessel_id" not in train.columns:
         raise ValueError("Training data needs target_vessel_id")
@@ -692,6 +736,7 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         raise ValueError(f"Training targets missing from catalog: {sorted(unknown)[:5]}")
     answers = AnswerBook(train)
     ranker = Ranker(train, catalog)
+    rows, recall = _row_matrices(train, ranker, index)
 
     def forest(n: int, seed: int):
         return RandomForestClassifier(
@@ -699,19 +744,23 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
             class_weight="balanced_subsample", n_jobs=-1, random_state=seed,
         )
 
-    # Stage 1: retrieval-order negatives.
-    X, y, _, recall = make_training_pairs(train, ranker, index)
+    def booster(seed: int):
+        return HistGradientBoostingClassifier(
+            max_iter=600, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=10,
+            l2_regularization=1.0, early_stopping=False, random_state=seed,
+        )
+
+    X, y = _select(rows, max_negatives)
     stage1 = forest(max(100, n_estimators // 2), random_state).fit(X, y)
-    # Stage 2: hard negatives mined with the stage-1 model.
     if hard_negatives:
-        X, y, _, _ = make_training_pairs(train, ranker, index, hard_model=stage1)
-    model = forest(n_estimators, random_state + 1).fit(X, y)
+        X, y = _select(rows, max_negatives, scorer=lambda M: stage1.predict_proba(M)[:, 1])
+    models = [forest(n_estimators, random_state + 1).fit(X, y), booster(random_state + 2).fit(X, y)]
     return {
         "version": VERSION,
         "feature_names": FEATURE_NAMES,
         "answers": answers,
         "ranker": ranker,
-        "model": model,
+        "model": models,
         "candidate_recall": recall,
         "n_train_rows": int(len(train)),
     }
@@ -724,13 +773,15 @@ def predict_ids(bundle: dict, queries: pd.DataFrame, index: CatalogIndex,
         raise ValueError("Model and feature code versions do not match")
     answers: AnswerBook = bundle["answers"]
     ranker: Ranker = bundle["ranker"]
-    model = bundle["model"]
+    models = bundle["model"]
+    if not isinstance(models, (list, tuple)):
+        models = [models]
     ids: list[str] = []
     sources: list[str] = []
     for start in range(0, len(queries), batch_size):
         rows = queries.iloc[start: start + batch_size].to_dict("records")
         pending: list[tuple[int, list[tuple[int, int]]]] = []
-        feats: list[list[float]] = []
+        mats: list[np.ndarray] = []
         batch_ids: list[str | None] = []
         batch_src: list[str] = []
         for pos, row in enumerate(rows):
@@ -741,11 +792,11 @@ def predict_ids(bundle: dict, queries: pd.DataFrame, index: CatalogIndex,
                 continue
             cands = ranker.candidates(row, index)
             pending.append((pos, cands))
-            feats.extend(ranker.features(row, index, i, b) for i, b in cands)
+            mats.append(pair_matrix(ranker, row, index, cands))
             batch_ids.append(None)
             batch_src.append("ranker")
         if pending:
-            scores = model.predict_proba(np.asarray(feats, dtype=np.float32))[:, 1]
+            scores = _score(models, np.vstack(mats))
             offset = 0
             for pos, cands in pending:
                 local = scores[offset: offset + len(cands)]
