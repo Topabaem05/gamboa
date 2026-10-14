@@ -27,12 +27,17 @@ def main() -> None:
     parser.add_argument("--catalog", default="data/vessel_catalog.csv")
     parser.add_argument("--out", default="model/bundle.pkl")
     parser.add_argument("--n-estimators", type=int, default=300)
+    parser.add_argument("--hangul-weight", type=float, default=3.0,
+                        help="sample weight of Korean-name query pairs (the metric weights them 0.7)")
+    parser.add_argument("--augment-copies", type=int, default=3,
+                        help="re-spelled copies of every Korean-named train vessel")
     args = parser.parse_args()
 
     train = pd.read_csv(args.train, encoding="utf-8-sig")
     catalog = pd.read_csv(args.catalog, encoding="utf-8-sig")
     started = time.time()
-    bundle = fit(train, catalog, n_estimators=args.n_estimators)
+    bundle = fit(train, catalog, n_estimators=args.n_estimators,
+                 hangul_weight=args.hangul_weight, augment_copies=args.augment_copies)
     print(f"fit done in {time.time() - started:.1f}s | candidate recall on train: "
           f"{bundle['candidate_recall']:.4f} | answer-book conflicts: {bundle['answers'].conflicts}")
 
