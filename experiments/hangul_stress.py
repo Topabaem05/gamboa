@@ -79,7 +79,8 @@ def run(df, label):
 run(va, 'asis')
 accs = []
 for rep in range(args.reps):
-    rng = random.Random(9_000_077 + 1000 * args.fold + rep)   # seeds disjoint from training augmentation; df = va.copy()
+    rng = random.Random(9_000_077 + 1000 * args.fold + rep)   # seeds disjoint from training augmentation
+    df = va.copy(); df = va.copy()
     names = {v: respell(n, rng) for v, n in df.groupby('target_vessel_id').vessel_name.first().items()}
     changed = sum(names[v] != n for v, n in df.groupby('target_vessel_id').vessel_name.first().items())
     df['vessel_name'] = df.target_vessel_id.map(names)

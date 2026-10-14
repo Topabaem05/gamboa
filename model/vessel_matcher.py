@@ -27,13 +27,14 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
-VERSION = "hardcoded-lookup+phonetic-hgb-rules-v7-hangul-aug"
+VERSION = "hardcoded-lookup+phonetic-hgb-rules-v8-skeleton"
 
 FEATURE_NAMES = (
     "latin_exact", "latin_lev", "latin_osa", "latin_bigram_jacc", "latin_trigram_jacc",
     "latin_prefix_ratio", "latin_length_ratio",
     "cons_exact", "cons_lev", "cons_bigram_jacc", "cons_trigram_jacc", "cons_length_ratio",
     "vow_exact", "vow_lev", "vow_osa", "vow_bigram_jacc",
+    "skel_exact", "skel_lev", "skel_token_exact",
     "token_lev_mean", "token_lev_min", "token_lev_max", "token_count_diff", "token_overlap",
     "latin_token_exact", "latin_token_osa_max",
     "first_token_exact", "last_token_exact", "last_token_osa", "last_token_cons_lev",
@@ -54,13 +55,14 @@ FEATURE_NAMES = (
     "digits_match_minus_max",
     "last_token_osa_minus_max", "is_max_last_token_osa",
     "type_size_logp_minus_max", "is_max_type_size_logp",
+    "skel_lev_minus_max", "is_max_skel_lev",
     "name_score_minus_max", "is_max_name_score",
 )
 _BASE_FEATURES = FEATURE_NAMES[:FEATURE_NAMES.index("n_candidates")]
 _LISTWISE = (("best_gap", "min"), ("cons_lev", "max"), ("latin_osa", "max"), ("vow_lev", "max"),
              ("flag_prob", "max"), ("type_prob", "max"), ("latin_token_exact", "max"),
              ("token_lev_max", "max"), ("digits_match", "max"), ("last_token_osa", "max"),
-             ("type_size_logp", "max"))
+             ("type_size_logp", "max"), ("skel_lev", "max"))
 
 
 def pair_matrix(ranker: "Ranker", row: dict, index: "CatalogIndex",
@@ -325,8 +327,14 @@ def _vowel_string(phones: list[str]) -> str:
     return re.sub(r"([^0-9])\1+", r"\1", s)
 
 
+def _skeleton_string(phones: list[str]) -> str:
+    """Consonant classes with every vowel run replaced by 'V' (vowel position, not identity)."""
+    s = "".join("V" if p.islower() else p for p in phones)
+    return re.sub(r"([^0-9])\1+", r"\1", s)
+
+
 @lru_cache(maxsize=None)
-def name_reps(value: str) -> tuple[str, str, str, tuple[str, ...], frozenset[str], tuple[str, ...]]:
+def name_reps(value: str) -> tuple[str, str, str, tuple[str, ...], frozenset[str], tuple[str, ...], str]:
     """(latin_key, consonant_string, vowel_string, token_consonant_strings, digits, latin_tokens)."""
     phones = _phones(value)
     cons_tokens = tuple(_consonant_string(p) for p in phones)
@@ -335,7 +343,8 @@ def name_reps(value: str) -> tuple[str, str, str, tuple[str, ...], frozenset[str
     vow = "".join(_vowel_string(p) for p in phones)
     digits = frozenset(re.findall(r"\d+", _clean(value)))
     latin_tokens = tuple(latin_key(t) for t in tokens(value))
-    return latin_key(value), cons, vow, cons_tokens, digits, latin_tokens
+    skel = "|".join(_skeleton_string(p) for p in phones)
+    return latin_key(value), cons, vow, cons_tokens, digits, latin_tokens, skel
 
 
 # --------------------------------------------------------------------------- #
@@ -630,6 +639,7 @@ class CatalogIndex:
         self.cons_tokens = [r[3] for r in reps]
         self.digits = [r[4] for r in reps]
         self.latin_tokens = [r[5] for r in reps]
+        self.skel = [r[6] for r in reps]
         self.token_sets = [frozenset(tokens(v)) for v in raw_names]
         # exact last word (the distinctive ship name) -> catalog rows; rescues renamed vessels
         self.last_word: dict[str, list[int]] = defaultdict(list)
@@ -739,7 +749,7 @@ class Ranker:
                    max_candidates: int = 160) -> list[tuple[int, int]]:
         """Return (catalog_index, source_bits): 1 = name, 2 = tonnage, 4 = exact."""
         name = row.get("vessel_name")
-        latin, cons, vow, _, _, qlt = name_reps(name if isinstance(name, str) else "")
+        latin, cons, vow, _, _, qlt, _ = name_reps(name if isinstance(name, str) else "")
         gross = positive_float(row.get("gross_tonnage"))
         intl = positive_float(row.get("international_gross_tonnage"))
         values = sorted({gross, intl} - {None})
@@ -796,7 +806,9 @@ class Ranker:
 
     def features(self, row: dict, index: CatalogIndex, cand: int, bits: int) -> list[float]:
         name = row.get("vessel_name")
-        qlatin, qcons, qvow, qtoks, qdigits, qlt = name_reps(name if isinstance(name, str) else "")
+        qlatin, qcons, qvow, qtoks, qdigits, qlt, qskel = name_reps(name if isinstance(name, str) else "")
+        cskel = index.skel[cand]
+        qskel_flat, cskel_flat = qskel.replace("|", ""), cskel.replace("|", "")
         clatin, ccons, cvow = index.latin[cand], index.cons[cand], index.vow[cand]
         ctoks, cdigits, clt = index.cons_tokens[cand], index.digits[cand], index.latin_tokens[cand]
         gross = positive_float(row.get("gross_tonnage"))
@@ -864,6 +876,9 @@ class Ranker:
             lev_sim(qvow, cvow),
             osa_sim(qvow, cvow),
             jaccard(grams(qvow, 2), index.vow_bi.sets[cand]),
+            float(bool(qskel_flat) and qskel_flat == cskel_flat),
+            lev_sim(qskel_flat, cskel_flat),
+            float(bool(qskel) and qskel == cskel),
             tok_mean,
             tok_min,
             tok_max,

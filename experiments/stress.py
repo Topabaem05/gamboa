@@ -14,7 +14,7 @@ import vessel_matcher as vm
 from vessel_matcher import *
 from vessel_matcher import _tonnage_noise_pairs
 
-ap = argparse.ArgumentParser(); ap.add_argument('--fold', type=int, default=0); ap.add_argument('--reps', type=int, default=3); ap.add_argument('--tag', default='v6'); ap.add_argument('--only', default='')
+ap = argparse.ArgumentParser(); ap.add_argument('--fold', type=int, default=0); ap.add_argument('--reps', type=int, default=3); ap.add_argument('--tag', default='v6'); ap.add_argument('--hw', type=float, default=1.0); ap.add_argument('--only', default='')
 args = ap.parse_args()
 S = os.environ.get('STRESS_DIR', 'experiments/out')
 tr = pd.read_csv('data/train.csv'); cat = pd.read_csv('data/vessel_catalog.csv')
@@ -25,7 +25,7 @@ path = f'{S}/fold{args.fold}_bundle.pkl' if args.tag == 'v6' else f'{S}/fold{arg
 if os.path.exists(path):
     bundle = joblib.load(path)
 else:
-    t = time.time(); bundle = fit(trn, cat, index=idx); joblib.dump(bundle, path, compress=3)
+    t = time.time(); bundle = fit(trn, cat, index=idx, hangul_weight=args.hw); joblib.dump(bundle, path, compress=3)
     print(f'trained fold {args.fold} in {time.time()-t:.0f}s', flush=True)
 
 # empirical noise
