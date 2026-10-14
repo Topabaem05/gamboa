@@ -27,7 +27,7 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
-VERSION = "hardcoded-lookup+phonetic-hgb-rules-v9"
+VERSION = "hardcoded-lookup+phonetic-hgb-rules-v10-monotonic"
 
 FEATURE_NAMES = (
     "latin_exact", "latin_lev", "latin_osa", "latin_bigram_jacc", "latin_trigram_jacc",
@@ -189,6 +189,7 @@ def _english_phones(word: str) -> list[str]:
     w = re.sub(r"NG(?![AEIOUYLR])", "N", w)
     w = re.sub(r"NH$", "N", w)                                  # Hochiminh -> 호치민
     w = re.sub(r"(?<=[AEIOU])H$", "", w)                        # Sarah -> 사라
+    w = w.replace("OO", "U").replace("EE", "I")                 # Woo -> 우, Queen -> 퀸
     w = re.sub(r"R(?![AEIOUYW])", "", w)                       # Harbour -> 하버, Lombard -> 롬바드
     silent_e = len(w) > 3 and w.endswith("E") and w[-2] not in "AEIOU"
     out: list[str] = []
@@ -992,6 +993,31 @@ NONAME_FEATURES = tuple(f for f in FEATURE_NAMES if any(f.startswith(k) for k in
 _NONAME_IDX = np.asarray([FEATURE_NAMES.index(f) for f in NONAME_FEATURES])
 
 
+_INCREASING = ("latin_exact", "latin_lev", "latin_osa", "latin_bigram_jacc", "latin_trigram_jacc",
+               "latin_prefix_ratio", "cons_exact", "cons_lev", "cons_bigram_jacc", "cons_trigram_jacc",
+               "vow_exact", "vow_lev", "vow_osa", "vow_bigram_jacc", "skel_exact", "skel_lev",
+               "skel_token_exact", "token_lev_mean", "token_lev_min", "token_lev_max", "token_overlap",
+               "latin_token_exact", "latin_token_osa_max", "first_token_exact", "last_token_exact",
+               "last_token_osa", "last_token_cons_lev", "gt_exact", "gt_exact_unique", "flag_prob",
+               "type_prob", "type_size_logp")
+_DECREASING = ("gross_gap", "intl_gap", "best_gap", "best_gap_minus_min")
+
+
+def monotonic_constraints() -> list[int]:
+    """+1: more similar name / likelier flag-type-size never lowers the score;
+    -1: a larger tonnage gap never raises it. Listwise versions follow their base feature."""
+    cst = []
+    for name in FEATURE_NAMES:
+        base = name[len("is_max_"):] if name.startswith("is_max_") else name.replace("_minus_max", "")
+        if name in _DECREASING:
+            cst.append(-1)
+        elif base in _INCREASING or name in ("name_score_minus_max", "is_max_name_score"):
+            cst.append(1)
+        else:
+            cst.append(0)
+    return cst
+
+
 def _fit_models(rows, n_estimators: int = 300, random_state: int = 42,
                 use_rf: bool = False, max_negatives: int = 40, noname: bool = False,
                 hangul_weight: float = 1.0) -> dict:
@@ -1001,16 +1027,16 @@ def _fit_models(rows, n_estimators: int = 300, random_state: int = 42,
     X_all = np.vstack([X for X, _ in rows])
     y_all = np.concatenate([y for _, y in rows])
 
-    def booster(seed: int):
+    def booster(seed: int, cst=None):
         return HistGradientBoostingClassifier(
             max_iter=600, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=20,
-            l2_regularization=1.0, early_stopping=False, random_state=seed,
+            l2_regularization=1.0, early_stopping=False, random_state=seed, monotonic_cst=cst,
         )
 
     weights = None
     if hangul_weight != 1.0:   # the metric weights Korean-name rows 0.7 although they are ~10% of rows
         weights = np.where(X_all[:, FEATURE_NAMES.index("query_is_hangul")] == 1, hangul_weight, 1.0)
-    models = {"hgb": booster(random_state).fit(X_all, y_all, sample_weight=weights)}
+    models = {"hgb": booster(random_state, monotonic_constraints()).fit(X_all, y_all, sample_weight=weights)}
     if noname:   # name-free fallback: hurt held-out accuracy, kept opt-in for experiments
         models["noname"] = booster(random_state + 1).fit(X_all[:, _NONAME_IDX], y_all)
     for m in models.values():
