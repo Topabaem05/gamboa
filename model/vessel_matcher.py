@@ -978,7 +978,8 @@ _NONAME_IDX = np.asarray([FEATURE_NAMES.index(f) for f in NONAME_FEATURES])
 
 
 def _fit_models(rows, n_estimators: int = 300, random_state: int = 42,
-                use_rf: bool = False, max_negatives: int = 40, noname: bool = False) -> dict:
+                use_rf: bool = False, max_negatives: int = 40, noname: bool = False,
+                hangul_weight: float = 1.0) -> dict:
     """Train the scorers on cached per-row candidate matrices."""
     from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 
@@ -991,7 +992,10 @@ def _fit_models(rows, n_estimators: int = 300, random_state: int = 42,
             l2_regularization=1.0, early_stopping=False, random_state=seed,
         )
 
-    models = {"hgb": booster(random_state).fit(X_all, y_all)}
+    weights = None
+    if hangul_weight != 1.0:   # the metric weights Korean-name rows 0.7 although they are ~10% of rows
+        weights = np.where(X_all[:, FEATURE_NAMES.index("query_is_hangul")] == 1, hangul_weight, 1.0)
+    models = {"hgb": booster(random_state).fit(X_all, y_all, sample_weight=weights)}
     if noname:   # name-free fallback: hurt held-out accuracy, kept opt-in for experiments
         models["noname"] = booster(random_state + 1).fit(X_all[:, _NONAME_IDX], y_all)
     for m in models.values():
@@ -1251,7 +1255,7 @@ _FEATURE_IDX = {name: i for i, name in enumerate(FEATURE_NAMES)}
 def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         random_state: int = 42, index: CatalogIndex | None = None,
         use_rf: bool = False, noname: bool = False, n_jobs: int | None = None,
-        augment_copies: int = 3, **_ignored) -> dict:
+        augment_copies: int = 3, hangul_weight: float = 1.0, **_ignored) -> dict:
     if "target_vessel_id" not in train.columns:
         raise ValueError("Training data needs target_vessel_id")
     index = index or CatalogIndex(catalog)
@@ -1265,7 +1269,7 @@ def fit(train: pd.DataFrame, catalog: pd.DataFrame, n_estimators: int = 300,
         model_rows = pd.concat([train, augment_hangul(train, catalog, copies=augment_copies)], ignore_index=True)
     rows, recall = _row_matrices(model_rows, ranker, index, n_jobs=n_jobs)
     models = _fit_models(rows, n_estimators=n_estimators, random_state=random_state,
-                         use_rf=use_rf, noname=noname)
+                         use_rf=use_rf, noname=noname, hangul_weight=hangul_weight)
     return {
         "version": VERSION,
         "feature_names": FEATURE_NAMES,
