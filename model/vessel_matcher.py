@@ -27,7 +27,7 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
-VERSION = "hardcoded-lookup+phonetic-hgb-rules-v8-skeleton"
+VERSION = "hardcoded-lookup+phonetic-hgb-rules-v9"
 
 FEATURE_NAMES = (
     "latin_exact", "latin_lev", "latin_osa", "latin_bigram_jacc", "latin_trigram_jacc",
@@ -262,7 +262,7 @@ _LETTER_PHONES = {
     "U": ["u"], "V": ["B", "u", "i"], "W": ["D", "e", "B", "u", "R", "u"], "X": ["e", "K", "S"],
     "Y": ["a", "i"], "Z": ["S", "e", "T"],
 }
-_INITIALISM = re.compile(r"^[B-DF-HJ-NP-TV-Z]{2,4}$")
+_INITIALISM = re.compile(r"^[B-DF-HJ-NP-TV-Z]{1,4}$")   # 1-4 consonant letters: S, KS, CNC, MSC
 _LETTER_KEYS = sorted(_LETTER_NAMES, key=len, reverse=True)
 
 
@@ -1184,7 +1184,9 @@ def _tonnage_flag_veto(X: np.ndarray, scores: np.ndarray) -> int | None:
     """When an exact-tonnage, best-flag candidate exists, a name-weak candidate that is far in
     tonnage (or non-exact with a worse flag) can never be chosen (0 truths lost in 1,854 rows)."""
     f = _FEATURE_IDX
-    if X[0, f["query_gt_missing"]] == 1:
+    # Latin queries only: for Korean names a consonant similarity of 0.8 is already a strong match,
+    # and reflagged vessels (JBU Sapphire) would be vetoed in favour of a tonnage coincidence.
+    if X[0, f["query_gt_missing"]] == 1 or X[0, f["query_is_hangul"]] == 1:
         return None
     W = (X[:, f["gt_exact"]] == 1) & (X[:, f["is_max_flag_prob"]] == 1) & (X[:, f["flag_prob"]] > 0)
     if not W.any():
